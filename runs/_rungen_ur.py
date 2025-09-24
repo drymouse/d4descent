@@ -4,7 +4,7 @@ import shutil
 import math
 
 PROJ_DIR = Path(__file__).parent.parent
-GEN_DIR = Path(__file__).parent / "_generated"
+GEN_DIR = folder = Path(__file__).parent / "_generated"
 
 
 def main():
@@ -14,13 +14,19 @@ def main():
     # loss
     b.add("---loss", "configs/losses/raster.yaml")
     # task
-    b.add("---task", "configs/tasks/arclines.yaml")
-    b.add("--task.rewrite_args.add_hole_random", True)
-    b.add("--task.arclines_args.ks_scale", 1 / math.sqrt(2))
+    b.add("---task", "configs/tasks/ur.yaml")
+    b.add("--task.rewrite_args.merge_threshold", 100)
+    b.add("--task.rewrite_args.remove_threshold", 0.005)
+    b.add("--task.rewrite_args.add_hole_weight", 1.0)
+    b.add("--task.ur_args.offset_scale", 0.0)
+    b.add("--task.cleanup_strategy", "smarter")
+    b.add("--task.ur_args.theta_scale", math.pi)
+    b.add("--task.node_weight", 1e-4)
     # optim
     b.add("--optim.proposal_trigger", "step")
     b.add("--optim.propose_every", 25)
     b.add("--optim.proposal_size", 64)
+    b.add("--optim.clip_grad", 2.0)
     b.add("--optim.n_steps", 5000)
     b.add("--optim.stopping_patience", 25)
     b.add("--optim.batch_param_count", 8192)
@@ -31,12 +37,13 @@ def main():
 
     b.add_sweep_set(
         {
-            "AL-F": {
-                # "--task.rewrite_args.add_holes_weight": 0.25, default
+            "UR-F": {},
+            "UR-1": {
+                "--task.rewrite_args.add_rect_weight": 0,
             },
-            # "AL-1": {
-            #     "--task.rewrite_args.add_holes_weight": 0.0,
-            # },
+            "UR-2": {
+                "--task.rewrite_args.add_hole_weight": 0,
+            },
         }
     )
 
@@ -44,7 +51,8 @@ def main():
         {
             "": {
                 "--optim.scheduler": "AdaptiveLR",
-                "--optim.lr": 0.5,
+                "--optim.lr": 0.2,
+                "--optim.reduce_lr_min_lr": 0.005,
             },
             # "_NoStep": {
             #     "--optim.proposal_steps": 0,
@@ -54,33 +62,12 @@ def main():
             # },
             # "_Fixed": {
             #     "--optim.scheduler": "none",
-            #     "--optim.lr": 0.05,
+            #     "--optim.lr": 0.02,
             # },
             # "_OneRewrite_Fixed": {
             #     "--optim.proposal_accept_parallel": False,
             #     "--optim.scheduler": "none",
-            #     "--optim.lr": 0.05,
-            # }
-        }
-    )
-
-    b.add_sweep_set(
-        {
-            "": {
-                "--task.line_weight": 1e-5,
-                "--task.arc_weight": 1e-5,
-            },
-            # "_w14": {
-            #     "--task.line_weight": 1e-4,
-            #     "--task.arc_weight": 1e-4,
-            # },
-            # "_w16": {
-            #     "--task.line_weight": 1e-6,
-            #     "--task.arc_weight": 1e-6,
-            # },
-            # "_w17": {
-            #     "--task.line_weight": 1e-7,
-            #     "--task.arc_weight": 1e-7,
+            #     "--optim.lr": 0.02,
             # },
         }
     )
@@ -99,7 +86,7 @@ def main():
         }
     )
 
-    gen_dir = GEN_DIR / "arclines"
+    gen_dir = GEN_DIR / "ur"
     if gen_dir.exists():
         shutil.rmtree(gen_dir)
     gen_dir.mkdir(exist_ok=True, parents=True)

@@ -1,0 +1,5 @@
+$type: d4descent.losses.topopt.TopoptArgs
+sens:
+  $type: d4descent.third_party.topopt.SensitivityAnalysisArgs
+  nelx: 96
+  nely: 96

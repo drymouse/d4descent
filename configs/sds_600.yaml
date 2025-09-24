@@ -1,0 +1,5 @@
+loss:
+  $type: d4descent.losses.sds.SDSLossArgs
+  prompt: ""
+render:
+  size: 600

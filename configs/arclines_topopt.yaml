@@ -1,0 +1,10 @@
+task:
+  $type: d4descent.tasks.arclines.ArclinesArgs
+loss:
+  $type: d4descent.losses.topopt.TopoptArgs
+  sens:
+    $type: d4descent.third_party.topopt.SensitivityAnalysisArgs
+    nelx: 64
+    nely: 64
+render:
+  size: 64
