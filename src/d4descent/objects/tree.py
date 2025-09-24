@@ -9,10 +9,10 @@ import torch
 from matplotlib.patches import Rectangle, Circle, Arc
 from matplotlib.lines import Line2D
 
-from geocad.context import Context
-from geocad.object_collection import ObjectCollection
-from geocad.util import safe_stack, safe_cat, maybe_detach
-from geocad.visualizer import LineStyle, MPLVisualizerAxes
+from ..context import Context
+from ..object_collection import ObjectCollection
+from ..util import safe_stack, safe_cat, maybe_detach
+from ..visualizer import LineStyle, MPLVisualizerAxes
 
 
 @dataclass
@@ -1558,30 +1558,6 @@ class TreeCollection(ObjectCollection[Tree]):
 
         res = torch.scatter_reduce(res, -1, idx_of.expand(*shape, -1), sdf_rects, reduce="amin")  # (..., n_trees)
         return res.permute(-1, *range(positions.ndim - 1))  # (n_trees, ...)
-
-    def render(
-        self,
-        size: int,
-        lim: tuple[float, float] = (-1.5, 1.5),
-        center_pixel: bool = True,
-    ) -> torch.Tensor:
-        """
-        Render as a signed distance field.
-        returns:
-        - img: (num_shapes, size, size)
-        """
-        device = self.device()
-        lim0, lim1 = lim
-
-        if center_pixel:
-            basis = (torch.arange(size, device=device) + 0.5) / size * (lim1 - lim0) + lim0  # (size,)
-        else:
-            basis = torch.linspace(lim0, lim1, size, device=device)  # (size,)
-        xs = basis.expand(size, -1)  # (size, size)
-        ys = basis.unsqueeze(-1).expand(-1, size)  # (size, size)
-        grid = torch.stack([xs, ys], dim=-1)  # (size, size, 2)
-        res = self.rasterize(grid)
-        return res
 
     def get_sizes(self) -> list[int]:
         return [len(x) for x in self.tree_node_ords]

@@ -21,6 +21,7 @@ dependencies = [
     "scikit-video>=1.1.11",
     "torch>=2.8.0",
     "torchvision>=0.23.0",
+    "transformers>=4.56.2",
 ]
 
 [build-system]

@@ -1,7 +1,7 @@
 import torch
 from dataclasses import dataclass
 
-from .objects.prim2 import Shape, Arc, Line, ShapeCollection
+from .objects.arclines import Shape, Arc, Line, ShapeCollection
 
 
 @dataclass

@@ -16,7 +16,7 @@ install()  # Enable rich traceback
 
 from d4descent.tasks._base import Task, TaskArgs, RenderArgs
 from d4descent.losses._base import LossArgs
-from d4descent.objects.prim2 import ShapeCollection, Shape, ShapeCollectionArgs
+from d4descent.objects.arclines import ShapeCollection, Shape, ShapeCollectionArgs
 from d4descent.util import torch_load, save_rgb8, save_video, read_points_npz, register_slurm_signal_handlers_auto
 from d4descent.metrics import compute_metric
 from d4descent.optimizer import OptimizeArgs, optimize, OnVisualizeFunc

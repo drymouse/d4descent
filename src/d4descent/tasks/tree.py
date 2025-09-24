@@ -5,7 +5,7 @@ from typing import Optional, Union, Literal
 import numpy as np
 
 from ..object_collection import ObjectCollection
-from ..tree2 import Tree, TreeCollection, TreeRewriteArgs, TreeRewriteType, TreeRewriteSpec, TreeCollectionArgs
+from ..objects.tree import Tree, TreeCollection, TreeRewriteArgs, TreeRewriteType, TreeRewriteSpec, TreeCollectionArgs
 from ._base import Task, TaskArgs, RenderArgs, StateT
 from ..visualizer import MPLVisualizer
 from ..losses._base import LossArgs

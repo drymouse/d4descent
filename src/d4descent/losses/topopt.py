@@ -8,8 +8,8 @@ from abc import abstractmethod
 from ..visualizer import MPLVisualizer
 from ..tasks._base import Task, ObjectT, RewriteSpecT, ExtraMetrics
 from ..object_collection import ObjectCollection
-from ..objects.prim2 import Shape, ShapeCollection, PrimitiveHelper, ShapeRewriteSpec
-from ..objects.csgb import CSGB, CSGBCollection, CSGBRewrite
+from ..objects.arclines import Shape, ShapeCollection, PrimitiveHelper, ShapeRewriteSpec
+from ..objects.ur import UR, URCollection, URRewrite
 from ..third_party.pid import PID
 from ..third_party.topopt import SensitivityAnalysisArgs, SensitivityAnalysis
 from ..losses._base import LossArgs
@@ -280,35 +280,35 @@ class TopoptArclinesMixin(TopoptMixin[Shape, ShapeRewriteSpec]):
         return fig.get_image()
 
 
-class TopoptCSGBMixin(TopoptMixin[CSGB, CSGBRewrite]):
-    def initialize_object(self) -> CSGB:
+class TopoptURMixin(TopoptMixin[UR, URRewrite]):
+    def initialize_object(self) -> UR:
         lim0, lim1 = self.lim
         xrange = lim1 - lim0
         device = self.device()
         match self.loss_args.init_setup:
             case "a":
-                return CSGB(
+                return UR(
                     xs=torch.tensor([[0.0, 0.0]], device=device),
                     sizes=torch.tensor([[xrange * 7 / 16, xrange / 4]], device=device),
                     rots=torch.tensor([0.0], device=device),
                     is_subs=torch.tensor([False], device=device),
                 )
             case "cantileaver":
-                return CSGB(
+                return UR(
                     xs=torch.tensor([[0.0, 0.0]], device=device),
                     sizes=torch.tensor([[xrange * 7 / 16, xrange * 7 / 32]], device=device),
                     rots=torch.tensor([0.0], device=device),
                     is_subs=torch.tensor([False], device=device),
                 )
             case "mbb":
-                return CSGB(
+                return UR(
                     xs=torch.tensor([[0.0, 0.0]], device=device),
                     sizes=torch.tensor([[xrange * 7 / 16, xrange * 7 / 96]], device=device),
                     rots=torch.tensor([0.0], device=device),
                     is_subs=torch.tensor([False], device=device),
                 )
             case "mbb_half":
-                return CSGB(
+                return UR(
                     xs=torch.tensor([[0.0, 0.0]], device=device),
                     sizes=torch.tensor([[xrange * 7 / 16, xrange * 7 / 48]], device=device),
                     rots=torch.tensor([0.0], device=device),
@@ -317,5 +317,5 @@ class TopoptCSGBMixin(TopoptMixin[CSGB, CSGBRewrite]):
             case _:
                 raise ValueError(f"Invalid init_setup: {self.loss_args.init_setup}")
 
-    def compute_constraints(self, collection: ObjectCollection[CSGB], state: TopoptState) -> torch.Tensor:
+    def compute_constraints(self, collection: ObjectCollection[UR], state: TopoptState) -> torch.Tensor:
         raise NotImplementedError()

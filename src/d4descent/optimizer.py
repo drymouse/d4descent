@@ -63,8 +63,6 @@ class OptimizeArgs:
     # early stopping
     stopping_eps: float = 5e-3
     stopping_patience: Optional[int] = None  # number of rewrites without improvement
-    # fix bug
-    fix_bug: bool = False
 
 
 class OnVisualizeFunc(Protocol):
@@ -206,9 +204,7 @@ def optimize(
 
                 if args.proposal_criterion == "loss":
                     for proposal_ in tqdm(batched_proposals):
-                        optimizer, scheduler = setup_optimizer(
-                            proposal_.parameters(), lr=cur_lr if args.fix_bug else None  # HACK: RIP
-                        )
+                        optimizer, scheduler = setup_optimizer(proposal_.parameters(), lr=cur_lr)
                         proposal_state = task.update_state_for_proposals(state, proposal_)
                         for _ in range(args.proposal_steps):
                             optimizer.zero_grad()

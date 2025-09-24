@@ -6,7 +6,7 @@ import numpy as np
 import random
 
 from ..object_collection import ObjectCollection
-from ..prim2 import (
+from ..objects.arclines import (
     Shape,
     ShapeCollection,
     ShapeRewriteArgs,
@@ -271,7 +271,7 @@ class ArclinesTopoptTask(TopoptArclinesMixin, ArclinesTask[TopoptState]):
 
 # check abstract methods
 if __name__ == "__main__":
-    from geocad.topopt import SensitivityAnalysisArgs
+    from ..third_party.topopt import SensitivityAnalysisArgs
 
     ArclinesRasterTask(ArclinesArgs(), RenderArgs(), RasterLossArgs(), torch.Tensor(0))
     ArclinesSDSTask(ArclinesArgs(), RenderArgs(), SDSLossArgs(prompt="astronaut"), "cpu")

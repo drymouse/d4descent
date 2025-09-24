@@ -6,30 +6,30 @@ import numpy as np
 
 from ..context import Context
 from ..object_collection import ObjectCollection
-from ..objects.csgb import (
-    CSGB,
-    CSGBCollection,
-    CSGBRewriteArgs,
-    CSGBRewriteType,
-    CSGBRewrite,
-    CSGBCollectionArgs,
+from ..objects.ur import (
+    UR,
+    URCollection,
+    URRewriteArgs,
+    URRewriteType,
+    URRewrite,
+    URColectionArgs,
     CleanStrategy,
 )
-from ..tasks._base import Task, ObjectT, TaskArgs, RenderArgs, StateT, ExtraMetrics
+from ._base import Task, ObjectT, TaskArgs, RenderArgs, StateT, ExtraMetrics
 from ..visualizer import MPLVisualizer
 from ..losses._base import LossArgs
 from ..losses.raster import RasterLossMixin, RasterLossArgs
 from ..losses.sds import SDSLossMixin, SDSLossArgs
-from ..losses.topopt import TopoptCSGBMixin, TopoptArgs, TopoptState
+from ..losses.topopt import TopoptURMixin, TopoptArgs, TopoptState
 
 
 @dataclass
-class CSGBArgs(TaskArgs):
+class URArgs(TaskArgs):
     # metrics
     node_weight: float = 1e-6
     size_weight: float = 0
     # rewrite args
-    rewrite_args: CSGBRewriteArgs = field(default_factory=CSGBRewriteArgs)  # only used if rewrite_algo == "rewrite"
+    rewrite_args: URRewriteArgs = field(default_factory=URRewriteArgs)  # only used if rewrite_algo == "rewrite"
     # cleanup
     cleanup_len: float = 0.01
     cleanup_area: float = 0.0005
@@ -39,8 +39,8 @@ class CSGBArgs(TaskArgs):
     # better
     better_rel_eps: float = 1e-2
     better_abs_eps: float = 1e-8
-    # csgb
-    csgb_args: CSGBCollectionArgs = field(default_factory=CSGBCollectionArgs)
+    # ur
+    ur_args: URColectionArgs = field(default_factory=URColectionArgs)
 
     def create(
         self,
@@ -51,72 +51,72 @@ class CSGBArgs(TaskArgs):
     ) -> "Task":
         if isinstance(loss_args, RasterLossArgs):
             assert target_img is not None, "target_img must be provided for RasterLossArgs"
-            return CSGBRasterTask(self, render_args, loss_args, target_img)
+            return URRasterTask(self, render_args, loss_args, target_img)
         elif isinstance(loss_args, SDSLossArgs):
-            return CSGBSDSTask(self, render_args, loss_args, device)
+            return URSDSTask(self, render_args, loss_args, device)
         elif isinstance(loss_args, TopoptArgs):
-            return CSGBTopoptTask(self, render_args, loss_args, device)
+            return URTopoptTask(self, render_args, loss_args, device)
         else:
             raise NotImplementedError(f"Unknown loss_args type: {type(loss_args)}")
 
 
-class CSGBTask(Task[CSGB, CSGBRewrite, StateT]):
-    def __init__(self, args: CSGBArgs, render_args: RenderArgs, device: Union[str, torch.device]):
+class URTask(Task[UR, URRewrite, StateT]):
+    def __init__(self, args: URArgs, render_args: RenderArgs, device: Union[str, torch.device]):
         super().__init__(render_args)
         self._device = torch.device(device)
         self.args = args
-        self._Collection = CSGBCollection.patch_args(self.args.csgb_args)
+        self._Collection = URCollection.patch_args(self.args.ur_args)
 
     def device(self) -> torch.device:
         return self._device
 
-    def get_collection_constructor(self) -> type[CSGBCollection]:
+    def get_collection_constructor(self) -> type[URCollection]:
         return self._Collection
 
-    def initialize_object(self) -> CSGB:
+    def initialize_object(self) -> UR:
         device = self.device()
-        return CSGB(
+        return UR(
             xs=torch.tensor([[0.0, 0.0]], device=self.device()),
             sizes=torch.tensor([[1.0, 1.0]], device=self.device()),
             rots=torch.tensor([0.0], device=self.device()),
             is_subs=torch.tensor([False], device=self.device()),
         )
 
-    def compute_simplicity(self, collection: ObjectCollection[CSGB]) -> list[float]:
+    def compute_simplicity(self, collection: ObjectCollection[UR]) -> list[float]:
         """
         Returns: (n,)
         """
-        assert isinstance(collection, CSGBCollection)
+        assert isinstance(collection, URCollection)
         metrics: list[float] = []
         for size_ in collection.get_sizes():
             metrics.append(size_ * self.args.node_weight)
         return metrics
 
-    def make_proposals_ex(self, obj: CSGB, num_proposals: int) -> tuple[ObjectCollection[CSGB], list[CSGBRewrite]]:
+    def make_proposals_ex(self, obj: UR, num_proposals: int) -> tuple[ObjectCollection[UR], list[URRewrite]]:
         assert num_proposals > 0, f"num_proposals must be positive, got {num_proposals}"
         specs = obj.gen_rewrite_specs(
-            self.args.rewrite_args, num_rewrites=num_proposals, lim=self.render_args.lim, csgb_args=self.args.csgb_args
+            self.args.rewrite_args, num_rewrites=num_proposals, lim=self.render_args.lim, ur_args=self.args.ur_args
         )
-        rewritten: list[CSGB] = []
+        rewritten: list[UR] = []
         for spec in specs:
-            rewritten.append(obj.apply_rewrite(spec, self.args.csgb_args))
+            rewritten.append(obj.apply_rewrite(spec, self.args.ur_args))
         return self._Collection.from_objects(rewritten), specs
 
-    def make_proposals(self, obj: CSGB) -> tuple[ObjectCollection[CSGB], list[CSGBRewrite]]:
+    def make_proposals(self, obj: UR) -> tuple[ObjectCollection[UR], list[URRewrite]]:
         raise NotImplementedError()
 
     def combine_proposals(
         self,
-        base: CSGB,
-        proposals: ObjectCollection[CSGB],
+        base: UR,
+        proposals: ObjectCollection[UR],
         base_loss: float,
         proposal_losses: list[float],
-        proposal_specs: list[CSGBRewrite],
+        proposal_specs: list[URRewrite],
         accept_parallel: bool = True,
-    ) -> tuple[CSGB, bool]:
-        assert isinstance(proposals, CSGBCollection)
+    ) -> tuple[UR, bool]:
+        assert isinstance(proposals, URCollection)
         scores: list[float] = []
-        candidates: list[CSGBRewrite] = []
+        candidates: list[URRewrite] = []
         for i in range(len(proposals)):
             loss_ = proposal_losses[i]
             abs_improvement_ = base_loss - loss_
@@ -128,19 +128,19 @@ class CSGBTask(Task[CSGB, CSGBRewrite, StateT]):
         if not accept_parallel:
             candidates = candidates[:1]
         if len(candidates) > 0:
-            return base.apply_all_rewrites(candidates, scores, self.args.csgb_args), True
+            return base.apply_all_rewrites(candidates, scores, self.args.ur_args), True
         return base, False
 
-    def compute_losses(self, collection: ObjectCollection[CSGB], state: StateT) -> tuple[torch.Tensor, ExtraMetrics]:
+    def compute_losses(self, collection: ObjectCollection[UR], state: StateT) -> tuple[torch.Tensor, ExtraMetrics]:
         losses, xtra = self._compute_losses(collection, state)
-        assert isinstance(collection, CSGBCollection)
+        assert isinstance(collection, URCollection)
         if self.args.size_weight > 0:
             sizes = collection.get_sum_sizes()
             losses = losses + self.args.size_weight * sizes
         return losses, xtra
 
-    def cleanup(self, collection: ObjectCollection[CSGB]) -> ObjectCollection[CSGB]:
-        new_collection: list[CSGB] = []
+    def cleanup(self, collection: ObjectCollection[UR]) -> ObjectCollection[UR]:
+        new_collection: list[UR] = []
         for node in collection:
             cleaned = node.cleanup(
                 len_eps=self.args.cleanup_len,
@@ -150,23 +150,23 @@ class CSGBTask(Task[CSGB, CSGBRewrite, StateT]):
                 merge_area_threshold=self.args.cleanup_merge_area_threshold,
                 lim=self.render_args.lim,
                 size=self.render_args.size,
-                csgb_args=self.args.csgb_args,
+                ur_args=self.args.ur_args,
             )
             new_collection.append(cleaned)
         return self._Collection.from_objects(new_collection)
 
 
-class CSGBRasterTask(RasterLossMixin[CSGB, CSGBRewrite, None], CSGBTask[None]):
-    def __init__(self, args: CSGBArgs, render_args: RenderArgs, raster_args: RasterLossArgs, target_img: torch.Tensor):
+class URRasterTask(RasterLossMixin[UR, URRewrite, None], URTask[None]):
+    def __init__(self, args: URArgs, render_args: RenderArgs, raster_args: RasterLossArgs, target_img: torch.Tensor):
         device = target_img.device
-        CSGBTask.__init__(self, args, render_args, device)
+        URTask.__init__(self, args, render_args, device)
         RasterLossMixin.__init__(self, raster_args, target_img)
 
     def initialize_state(self) -> None:
         return None
 
-    def visualize(self, collection: ObjectCollection[CSGB], step: int, loss: float, state: None) -> np.ndarray:
-        assert isinstance(collection, CSGBCollection)
+    def visualize(self, collection: ObjectCollection[UR], step: int, loss: float, state: None) -> np.ndarray:
+        assert isinstance(collection, URCollection)
         assert len(collection) == 1
         shape = collection[0]
         fig = MPLVisualizer(1, 1, 10.8, 10.8, xlim=self.render_args.lim, ylim=self.render_args.lim, notebook=False)
@@ -194,22 +194,22 @@ class CSGBRasterTask(RasterLossMixin[CSGB, CSGBRewrite, None], CSGBTask[None]):
             vmax=1,
             alpha=0.2,
         )
-        shape.visualize(ax, self.args.csgb_args)
+        shape.visualize(ax, self.args.ur_args)
         return fig.get_image()
 
 
-class CSGBSDSTask(SDSLossMixin[CSGB, CSGBRewrite, None], CSGBTask[None]):
+class URSDSTask(SDSLossMixin[UR, URRewrite, None], URTask[None]):
     def __init__(
-        self, args: CSGBArgs, render_args: RenderArgs, sds_args: SDSLossArgs, device: Union[str, torch.device]
+        self, args: URArgs, render_args: RenderArgs, sds_args: SDSLossArgs, device: Union[str, torch.device]
     ):
-        CSGBTask.__init__(self, args, render_args, device)
+        URTask.__init__(self, args, render_args, device)
         SDSLossMixin.__init__(self, sds_args)
 
     def initialize_state(self) -> None:
         return None
 
-    def visualize(self, collection: ObjectCollection[CSGB], step: int, loss: float, state: None) -> np.ndarray:
-        assert isinstance(collection, CSGBCollection)
+    def visualize(self, collection: ObjectCollection[UR], step: int, loss: float, state: None) -> np.ndarray:
+        assert isinstance(collection, URCollection)
         assert len(collection) == 1
         shape = collection[0]
         fig = MPLVisualizer(1, 1, 10.8, 10.8, xlim=self.render_args.lim, ylim=self.render_args.lim, notebook=False)
@@ -229,22 +229,22 @@ class CSGBSDSTask(SDSLossMixin[CSGB, CSGBRewrite, None], CSGBTask[None]):
             vmax=1,
             alpha=0.2,
         )
-        shape.visualize(ax, self.args.csgb_args)
+        shape.visualize(ax, self.args.ur_args)
         return fig.get_image()
 
 
-class CSGBTopoptTask(TopoptCSGBMixin, CSGBTask[TopoptState]):
+class URTopoptTask(TopoptURMixin, URTask[TopoptState]):
     def __init__(
-        self, args: CSGBArgs, render_args: RenderArgs, topopt_args: TopoptArgs, device: Union[str, torch.device]
+        self, args: URArgs, render_args: RenderArgs, topopt_args: TopoptArgs, device: Union[str, torch.device]
     ):
         assert (
             render_args.size == topopt_args.sens.nelx
         ), f"render_args.size != topopt_args.sens.nelx, got {render_args.size} != {topopt_args.sens.nelx}"
-        CSGBTask.__init__(self, args, render_args, device)
-        TopoptCSGBMixin.__init__(self, topopt_args, render_args.lim, device)
+        URTask.__init__(self, args, render_args, device)
+        TopoptURMixin.__init__(self, topopt_args, render_args.lim, device)
 
-    def visualize(self, collection: ObjectCollection[CSGB], step: int, loss: float, state: TopoptState) -> np.ndarray:
-        assert isinstance(collection, CSGBCollection)
+    def visualize(self, collection: ObjectCollection[UR], step: int, loss: float, state: TopoptState) -> np.ndarray:
+        assert isinstance(collection, URCollection)
         assert len(collection) == 1
         shape = collection[0]
         fig = MPLVisualizer(1, 1, 10.8, 10.8, xlim=self.render_args.lim, ylim=self.render_args.lim, notebook=False)
@@ -269,7 +269,7 @@ class CSGBTopoptTask(TopoptCSGBMixin, CSGBTask[TopoptState]):
             f"\n$\\lambda$: {lambda_:.2f} occ: {occ.mean():.3f}/{state.pids[0].setpoint:.3f}"
             f"\narea: {area:.2f}/{self.total_area * self.target_vol:.2f}"
         )
-        shape.visualize(ax, csgb_args=self.args.csgb_args)
+        shape.visualize(ax, ur_args=self.args.ur_args)
         # ax.ax.imshow(
         #     img.clamp(-self.grad_v, self.grad_v).detach().cpu().numpy(),
         #     extent=(self.lim[0], self.lim[1], self.lim[1], self.lim[0]),
@@ -297,4 +297,4 @@ class CSGBTopoptTask(TopoptCSGBMixin, CSGBTask[TopoptState]):
 
 # check abstract methods
 if __name__ == "__main__":
-    CSGBRasterTask(CSGBArgs(), RenderArgs(), RasterLossArgs(), torch.Tensor(0))
+    URRasterTask(URArgs(), RenderArgs(), RasterLossArgs(), torch.Tensor(0))

@@ -1011,7 +1011,7 @@ class Shape:
 
         if len(add_holes) > 0:
             positions = torch.tensor(add_holes, device=self.device())[..., :2]
-            _, wn = ShapeCollection.from_shape(self).rasterize(positions)  # (num_holes,)
+            _, wn = ShapeCollection.from_shape(self)._rasterize(positions)  # (num_holes,)
 
             for x, y, r, reversed, n_segments in add_holes:
                 new_prims.extend(
@@ -1254,7 +1254,7 @@ class Shape:
         for loop, area in loops:
             positions = torch.stack([self.primitives[i].start for i in loop], dim=0)  # (loop_size, 2)
             if len(cur_prims) > 0:
-                _, wn = ShapeCollection.from_shape(Shape(cur_prims, id=-1)).rasterize(positions)
+                _, wn = ShapeCollection.from_shape(Shape(cur_prims, id=-1))._rasterize(positions)
                 rev = (wn.abs() > torch.pi).sum().item() >= (wn.numel() // 2)
             else:
                 rev = False
@@ -1293,7 +1293,7 @@ class Shape:
         returns: list of shapes (num_holes,) each with each hole
         """
         assert positions.ndim == 2, f"positions must be (num_holes, 2), got {positions.shape}"
-        _, wn = ShapeCollection.from_shape(self).rasterize(positions)  # (num_holes,)
+        _, wn = ShapeCollection.from_shape(self)._rasterize(positions)  # (num_holes,)
         res: list[ShapeRewriteSpec] = []
         for wn_, pos_ in zip(wn[0].tolist(), positions):
             res.append(
@@ -1964,7 +1964,7 @@ class ShapeCollection(ObjectCollection[Shape]):
         return cls.cat([cls.from_shape(shape) for shape in shapes])
 
     @classmethod
-    def cat(cls, collections: list["ShapeCollection"], **kwargs) -> "ShapeCollection":
+    def cat(cls, collections: list["ShapeCollection"], **kwargs) -> "ShapeCollection":  # type: ignore[override]
         assert len(collections) > 0, "collections must not be empty"
         device = collections[0].device()
 
@@ -2241,23 +2241,22 @@ class ShapeCollection(ObjectCollection[Shape]):
         xs = basis.expand(size, -1)  # (size, size)
         ys = basis.unsqueeze(-1).expand(-1, size)  # (size, size)
         grid = torch.stack([xs, ys], dim=-1)  # (size, size, 2)
-        return self.rasterize(grid)
+        return self._rasterize(grid)
 
-    def render(
+    def rasterize(
         self,
-        size: int,
-        lim: tuple[float, float] = (-1.5, 1.5),
-        center_pixel: bool = True,
+        positions: torch.Tensor,
     ) -> torch.Tensor:
         """
         Render as a signed distance field.
-        returns:
-        - img: (num_shapes, size, size)
-        - wn: (num_shapes, size, size)
-        """
-        return self.render_with_wn(size, lim, center_pixel)[0]
+        - positions: (..., 2)
 
-    def rasterize(
+        returns:
+        - img: (num_shapes, ...)
+        """
+        return self._rasterize(positions)[0]
+
+    def _rasterize(
         self,
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:

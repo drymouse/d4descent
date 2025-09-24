@@ -8,9 +8,9 @@ import random
 import time
 import math
 
-from geocad.types import Device, Box
-from geocad.object_collection import ObjectCollection
-from geocad.losses._base import LossArgs
+from ..types import Device, Box
+from ..object_collection import ObjectCollection
+from ..losses._base import LossArgs
 
 
 ObjectT = TypeVar("ObjectT")

@@ -16,7 +16,7 @@ from ..object_collection import ObjectCollection
 
 
 @dataclass
-class CSGBRewriteArgs:
+class URRewriteArgs:
     split_h_weight: float = 1.0
     split_v_weight: float = 1.0
     add_rect_weight: float = 1.0
@@ -31,7 +31,7 @@ class CSGBRewriteArgs:
 
 
 @dataclass
-class CSGBCollectionArgs:
+class URColectionArgs:
     theta_scale: float = torch.pi
     offset_scale: float = 1.0
 
@@ -39,7 +39,7 @@ class CSGBCollectionArgs:
 CleanStrategy = Literal["none", "smart", "smarter"]
 
 
-class CSGBRewriteType(Enum):
+class URRewriteType(Enum):
     SplitH = 0  # (id, t)
     SplitV = 1  # (id, t)
     AddHole = 2  # (x, y)
@@ -49,27 +49,27 @@ class CSGBRewriteType(Enum):
 
 
 @dataclass
-class CSGBRewrite:
-    rewrite_type: CSGBRewriteType
+class URRewrite:
+    rewrite_type: URRewriteType
 
 
 @dataclass
-class CSGBRewriteSplitH(CSGBRewrite):
-    rewrite_type: CSGBRewriteType = field(default=CSGBRewriteType.SplitH, init=False)
+class URRewriteSplitH(URRewrite):
+    rewrite_type: URRewriteType = field(default=URRewriteType.SplitH, init=False)
     id_: int
     t: float
 
 
 @dataclass
-class CSGBRewriteSplitV(CSGBRewrite):
-    rewrite_type: CSGBRewriteType = field(default=CSGBRewriteType.SplitV, init=False)
+class URRewriteSplitV(URRewrite):
+    rewrite_type: URRewriteType = field(default=URRewriteType.SplitV, init=False)
     id_: int
     t: float
 
 
 @dataclass
-class CSGBRewriteAddRect(CSGBRewrite):
-    rewrite_type: CSGBRewriteType = field(default=CSGBRewriteType.AddRect, init=False)
+class URRewriteAddRect(URRewrite):
+    rewrite_type: URRewriteType = field(default=URRewriteType.AddRect, init=False)
     x: float
     y: float
     s: float
@@ -78,8 +78,8 @@ class CSGBRewriteAddRect(CSGBRewrite):
 
 
 @dataclass
-class CSGBRewriteAddHole(CSGBRewrite):
-    rewrite_type: CSGBRewriteType = field(default=CSGBRewriteType.AddHole, init=False)
+class URRewriteAddHole(URRewrite):
+    rewrite_type: URRewriteType = field(default=URRewriteType.AddHole, init=False)
     x: float
     y: float
     s: float
@@ -87,14 +87,14 @@ class CSGBRewriteAddHole(CSGBRewrite):
 
 
 @dataclass
-class CSGBRewriteRemoveRect(CSGBRewrite):
-    rewrite_type: CSGBRewriteType = field(default=CSGBRewriteType.RemoveRect, init=False)
+class URRewriteRemoveRect(URRewrite):
+    rewrite_type: URRewriteType = field(default=URRewriteType.RemoveRect, init=False)
     id_: int
 
 
 @dataclass
-class CSGBRewriteMerge(CSGBRewrite):
-    rewrite_type: CSGBRewriteType = field(default=CSGBRewriteType.Merge, init=False)
+class URRewriteMerge(URRewrite):
+    rewrite_type: URRewriteType = field(default=URRewriteType.Merge, init=False)
     id1: int
     id2: int
     center: torch.Tensor  # (2,)
@@ -103,18 +103,18 @@ class CSGBRewriteMerge(CSGBRewrite):
 
 
 @dataclass
-class CSGBPayload:
+class URPayload:
     pass
 
 
 @dataclass
-class CSGB:
+class UR:
     xs: torch.Tensor  # (n_shapes, 2)
     sizes: torch.Tensor  # (n_shapes, 2)
     rots: torch.Tensor  # (n_shapes,)
     is_subs: torch.Tensor  # (n_shapes,)
     id: int = field(default_factory=lambda: Context.get().gen_id())
-    payload: CSGBPayload = field(default_factory=CSGBPayload)
+    payload: URPayload = field(default_factory=URPayload)
 
     def __post_init__(self):
         assert self.xs.ndim == 2, f"xs must be a 2D tensor, got {self.xs.ndim}"
@@ -128,7 +128,7 @@ class CSGB:
     def visualize(
         self,
         ax: MPLVisualizerAxes,
-        csgb_args: CSGBCollectionArgs,
+        ur_args: URColectionArgs,
         line_style: LineStyle = LineStyle(),
         sub_line_style: LineStyle = LineStyle(color="red"),
     ) -> None:
@@ -141,7 +141,7 @@ class CSGB:
                     (cx - sx, cy - sy),
                     sx * 2,
                     sy * 2,
-                    angle=rot * 180 / math.pi * csgb_args.theta_scale,
+                    angle=rot * 180 / math.pi * ur_args.theta_scale,
                     rotation_point="center",
                     color=line_style_.color,
                     linewidth=line_style_.linewidth,
@@ -159,8 +159,8 @@ class CSGB:
         merge_area_threshold: float,
         lim: tuple[float, float],
         size: int,
-        csgb_args: CSGBCollectionArgs,
-    ) -> "CSGB":
+        ur_args: URColectionArgs,
+    ) -> "UR":
         xs = self.xs
         sizes = self.sizes
         rots = self.rots
@@ -171,7 +171,7 @@ class CSGB:
             mask = (s.min(dim=-1).values > len_eps) & (s.prod(dim=-1) > area_eps)
         if not mask.any():
             # don't do anything
-            return CSGB(
+            return UR(
                 xs=xs,
                 sizes=sizes,
                 rots=rots,
@@ -184,7 +184,7 @@ class CSGB:
             is_subs = is_subs[mask]
 
         if clean_strategy == "none":
-            return CSGB(
+            return UR(
                 xs=xs,
                 sizes=sizes,
                 rots=rots,
@@ -200,7 +200,7 @@ class CSGB:
                 nxs = math.ceil(sizes_[0].abs().item() / split_len)
                 nys = math.ceil(sizes_[1].abs().item() / split_len)
                 new_xs__, new_sizes__, new_rots__ = _split_rect(
-                    xs_, sizes_, rots_, [i / nxs for i in range(1, nxs)], [i / nys for i in range(1, nys)], csgb_args
+                    xs_, sizes_, rots_, [i / nxs for i in range(1, nxs)], [i / nys for i in range(1, nys)], ur_args
                 )
                 new_xs_.append(new_xs__)
                 new_sizes_.append(new_sizes__)
@@ -214,7 +214,7 @@ class CSGB:
             # merge back
             while True:
                 ijs, m_xs, m_sizes, m_rots, m_area_gain = _gen_merge_candidates(
-                    new_xs, new_sizes, new_rots, new_is_subs, merge_area_threshold, csgb_args
+                    new_xs, new_sizes, new_rots, new_is_subs, merge_area_threshold, ur_args
                 )
 
                 used = set()
@@ -250,7 +250,7 @@ class CSGB:
                 if len(used) == 0:
                     break
 
-            return CSGB(
+            return UR(
                 xs=new_xs,
                 sizes=new_sizes,
                 rots=new_rots,
@@ -277,7 +277,7 @@ class CSGB:
                 nxs = math.ceil(sizes_[0].abs().item() / split_len)
                 nys = math.ceil(sizes_[1].abs().item() / split_len)
                 new_xs__, new_sizes__, new_rots__ = _split_rect(
-                    xs_, sizes_, rots_, [i / nxs for i in range(1, nxs)], [i / nys for i in range(1, nys)], csgb_args
+                    xs_, sizes_, rots_, [i / nxs for i in range(1, nxs)], [i / nys for i in range(1, nys)], ur_args
                 )
                 new_xs_.append(new_xs__)
                 new_sizes_.append(new_sizes__)
@@ -294,8 +294,8 @@ class CSGB:
             ys__ = basis.unsqueeze(-1).expand(-1, size)  # (size, size)
             positions = torch.stack([xs__, ys__], dim=-1).flatten(0, 1)  # (size * size, 2)
 
-            cos_ = torch.cos(new_rots * csgb_args.theta_scale)  # (n_subrects,)
-            sin_ = torch.sin(new_rots * csgb_args.theta_scale)  # (n_subrects,)
+            cos_ = torch.cos(new_rots * ur_args.theta_scale)  # (n_subrects,)
+            sin_ = torch.sin(new_rots * ur_args.theta_scale)  # (n_subrects,)
             irot = torch.stack([cos_, sin_, -sin_, cos_], dim=-1).reshape(-1, 2, 2)  # (total_nodes, 2, 2)
             diff = (irot @ (positions.unsqueeze(-2) - new_xs).unsqueeze(-1)).squeeze(
                 -1
@@ -351,8 +351,8 @@ class CSGB:
                 tymax = (ny - trim_top) / ny
                 # trim the rects
                 rot_ = rots[i_]
-                cos_ = (rot_ * csgb_args.theta_scale).cos()
-                sin_ = (rot_ * csgb_args.theta_scale).sin()
+                cos_ = (rot_ * ur_args.theta_scale).cos()
+                sin_ = (rot_ * ur_args.theta_scale).sin()
                 dx = torch.stack([cos_, sin_])  # (2,)
                 dy = torch.stack([-sin_, cos_])  # (2,)
                 size_ = sizes[i_].abs()  # (2,)
@@ -365,7 +365,7 @@ class CSGB:
             new_xs = torch.stack(new_xs_, dim=0)  # (n_subrects, 2)
             new_sizes = torch.stack(new_sizes_, dim=0)  # (n_subrects, 2)
             new_rots = torch.stack(new_rots_, dim=0)  # (n_subrects,)
-            return CSGB(
+            return UR(
                 xs=new_xs,
                 sizes=new_sizes,
                 rots=new_rots,
@@ -375,102 +375,102 @@ class CSGB:
             raise ValueError(f"Unknown clean_strategy {clean_strategy}")
 
     def gen_rewrite_specs(
-        self, args: CSGBRewriteArgs, num_rewrites: int, lim: tuple[float, float], csgb_args: CSGBCollectionArgs
-    ) -> list[CSGBRewrite]:
+        self, args: URRewriteArgs, num_rewrites: int, lim: tuple[float, float], ur_args: URColectionArgs
+    ) -> list[URRewrite]:
         # TODO: fix the distribution according to weights
 
         # merge
-        merge_rewrites: list[CSGBRewrite] = []
+        merge_rewrites: list[URRewrite] = []
         if args.merge_weight > 0.0:
             merge_ij, merge_center, merge_size, merge_rot, _ = self._gen_merge_candidates(
-                lossy_threshold=args.merge_threshold, csgb_args=csgb_args
+                lossy_threshold=args.merge_threshold, ur_args=ur_args
             )
             merge_rewrites = [
-                CSGBRewriteMerge(i, j, center, size, rot)
+                URRewriteMerge(i, j, center, size, rot)
                 for (i, j), center, size, rot in zip(merge_ij, merge_center, merge_size, merge_rot)
             ]
 
         # remove
-        remove_rewrites: list[CSGBRewrite] = []
+        remove_rewrites: list[URRewrite] = []
         if args.remove_rect_weight > 0.0 and len(self.xs) > 1:
             area = self.sizes.abs().prod(dim=-1)  # (n_rects,)
             removable: list[int] = (area <= args.remove_threshold).nonzero().flatten().tolist()
-            remove_rewrites = [CSGBRewriteRemoveRect(i) for i in removable]
+            remove_rewrites = [URRewriteRemoveRect(i) for i in removable]
 
         # split
-        split_h_rewrites: list[CSGBRewrite] = []
-        split_v_rewrites: list[CSGBRewrite] = []
+        split_h_rewrites: list[URRewrite] = []
+        split_v_rewrites: list[URRewrite] = []
         if args.split_h_weight > 0.0:
             for i in range(len(self.xs)):
-                split_h_rewrites.append(CSGBRewriteSplitH(i, random.random()))
+                split_h_rewrites.append(URRewriteSplitH(i, random.random()))
         if args.split_v_weight > 0.0:
             for i in range(len(self.xs)):
-                split_v_rewrites.append(CSGBRewriteSplitV(i, random.random()))
+                split_v_rewrites.append(URRewriteSplitV(i, random.random()))
 
         # add rect
         lim0, lim1 = lim
-        add_rect_rewrites: list[CSGBRewrite] = []
+        add_rect_rewrites: list[URRewrite] = []
         if args.add_rect_weight > 0.0 or args.add_hole_weight > 0.0:
             n_ = max(len(self.xs), 32)
             pos = torch.rand((n_, 2), device=self.xs.device) * (lim1 - lim0) + lim0  # (n_, 2)
-            rs = torch.rand((n_,), device=self.xs.device) * torch.pi / 2 / csgb_args.theta_scale  # (n_,)
-            inside = (CSGBCollection.from_object(self, args=csgb_args).rasterize(pos)[0] < 0).tolist()  # (n_,)
+            rs = torch.rand((n_,), device=self.xs.device) * torch.pi / 2 / ur_args.theta_scale  # (n_,)
+            inside = (URCollection.from_object(self, args=ur_args).rasterize(pos)[0] < 0).tolist()  # (n_,)
             for (x, y), inside_, r_ in zip(pos.tolist(), inside, rs.tolist()):
                 if not inside_:
                     if args.add_rect_weight > 0.0:
-                        add_rect_rewrites.append(CSGBRewriteAddRect(x, y, args.rect_scale, r_, False))
+                        add_rect_rewrites.append(URRewriteAddRect(x, y, args.rect_scale, r_, False))
                 else:
                     if args.add_hole_weight > 0.0:
-                        add_rect_rewrites.append(CSGBRewriteAddHole(x, y, args.hole_scale, False))
+                        add_rect_rewrites.append(URRewriteAddHole(x, y, args.hole_scale, False))
 
         rewrites = merge_rewrites + remove_rewrites + split_h_rewrites + split_v_rewrites + add_rect_rewrites
         return random.sample(rewrites, min(num_rewrites, len(rewrites)))
 
-    def apply_rewrite(self, spec: CSGBRewrite, csgb_args: CSGBCollectionArgs) -> "CSGB":
-        if isinstance(spec, CSGBRewriteSplitH) or isinstance(spec, CSGBRewriteSplitV):
+    def apply_rewrite(self, spec: URRewrite, ur_args: URColectionArgs) -> "UR":
+        if isinstance(spec, URRewriteSplitH) or isinstance(spec, URRewriteSplitV):
             id_, t = spec.id_, spec.t
             rtype = spec.rewrite_type
             new_xs, new_sizes, new_rots = _split_rect(
                 self.xs[id_],
                 self.sizes[id_],
                 self.rots[id_],
-                [t] if rtype == CSGBRewriteType.SplitH else [],
-                [t] if rtype == CSGBRewriteType.SplitV else [],
-                csgb_args,
+                [t] if rtype == URRewriteType.SplitH else [],
+                [t] if rtype == URRewriteType.SplitV else [],
+                ur_args,
             )
             new_is_subs = torch.full((len(new_xs),), self.is_subs[id_].item(), device=self.is_subs.device)
-            return CSGB(
+            return UR(
                 xs=torch.cat([self.xs[:id_, ...], new_xs, self.xs[id_ + 1 :, ...]], dim=0),
                 sizes=torch.cat([self.sizes[:id_, ...], new_sizes, self.sizes[id_ + 1 :, ...]], dim=0),
                 rots=torch.cat([self.rots[:id_, ...], new_rots, self.rots[id_ + 1 :, ...]], dim=0),
                 is_subs=torch.cat([self.is_subs[:id_, ...], new_is_subs, self.is_subs[id_ + 1 :, ...]], dim=0),
             )
-        elif isinstance(spec, CSGBRewriteAddRect):
+        elif isinstance(spec, URRewriteAddRect):
             x, y, s = spec.x, spec.y, spec.s
             r, is_sub = spec.r, spec.is_sub
             new_xs = torch.tensor([[x, y]], device=self.xs.device)
             new_sizes = torch.tensor([[s, s]], device=self.xs.device)
             new_rots = torch.tensor([r], device=self.xs.device)
             new_is_subs = torch.tensor([is_sub], device=self.xs.device)
-            return CSGB(
+            return UR(
                 xs=torch.cat([self.xs, new_xs], dim=0),
                 sizes=torch.cat([self.sizes, new_sizes], dim=0),
                 rots=torch.cat([self.rots, new_rots], dim=0),
                 is_subs=torch.cat([self.is_subs, new_is_subs], dim=0),
             )
-        elif isinstance(spec, CSGBRewriteRemoveRect):
+        elif isinstance(spec, URRewriteRemoveRect):
             id_ = spec.id_
             new_xs = torch.cat([self.xs[:id_, ...], self.xs[id_ + 1 :, ...]], dim=0)
             new_sizes = torch.cat([self.sizes[:id_, ...], self.sizes[id_ + 1 :, ...]], dim=0)
             new_rots = torch.cat([self.rots[:id_, ...], self.rots[id_ + 1 :, ...]], dim=0)
             new_is_subs = torch.cat([self.is_subs[:id_, ...], self.is_subs[id_ + 1 :, ...]], dim=0)
-            return CSGB(
+            return UR(
                 xs=new_xs,
                 sizes=new_sizes,
                 rots=new_rots,
                 is_subs=new_is_subs,
             )
-        elif isinstance(spec, CSGBRewriteMerge):
+        elif isinstance(spec, URRewriteMerge):
             id1, id2, center, size, rot = spec.id1, spec.id2, spec.center, spec.size, spec.rot
             assert id1 < id2, f"id1 must be less than id2, got {id1} >= {id2}"
             assert (
@@ -496,13 +496,13 @@ class CSGB:
                 ],
                 dim=0,
             )
-            return CSGB(
+            return UR(
                 xs=new_xs,
                 sizes=new_sizes,
                 rots=new_rots,
                 is_subs=new_is_subs,
             )
-        elif isinstance(spec, CSGBRewriteAddHole):
+        elif isinstance(spec, URRewriteAddHole):
             x, y, s, is_sub = spec.x, spec.y, spec.s, spec.is_sub
             is_sub_mask = self.is_subs == is_sub
             device = self.xs.device
@@ -512,9 +512,9 @@ class CSGB:
                 self.rots[is_sub_mask],
                 torch.tensor([x, y], device=device),
                 s,
-                csgb_args,
+                ur_args,
             )
-            return CSGB(
+            return UR(
                 xs=torch.cat([self.xs[~is_sub_mask], new_xs], dim=0),
                 sizes=torch.cat([self.sizes[~is_sub_mask], new_sizes], dim=0),
                 rots=torch.cat([self.rots[~is_sub_mask], new_rots], dim=0),
@@ -524,38 +524,38 @@ class CSGB:
             raise ValueError(f"Unknown rewrite {spec}")
 
     def apply_all_rewrites(
-        self, rewrites: list[CSGBRewrite], scores: list[float], csgb_args: CSGBCollectionArgs
-    ) -> "CSGB":
+        self, rewrites: list[URRewrite], scores: list[float], ur_args: URColectionArgs
+    ) -> "UR":
         # sort rewrites
-        rewrites, scores = zip(*sorted(zip(rewrites, scores), key=lambda x: x[1], reverse=True))
+        rewrites, scores = zip(*sorted(zip(rewrites, scores), key=lambda x: x[1], reverse=True))  # type: ignore
         # print("\n".join(map(str, list(zip(rewrites, scores)))))
 
         n_delete = 0
         deleted: set[int] = set()
         splits: dict[int, tuple[list[float], list[float]]] = {}
-        merges: dict[int, CSGBRewriteMerge] = {}
+        merges: dict[int, URRewriteMerge] = {}
         add_rects: list[tuple[float, float, float, float, bool]] = []
-        add_holes: list[CSGBRewriteAddHole] = []
+        add_holes: list[URRewriteAddHole] = []
         for spec in rewrites:
-            if isinstance(spec, CSGBRewriteSplitH) or isinstance(spec, CSGBRewriteSplitV):
+            if isinstance(spec, URRewriteSplitH) or isinstance(spec, URRewriteSplitV):
                 id_, t = spec.id_, spec.t
                 id_ = int(id_)
                 if id_ in deleted:
                     continue
                 if id_ not in splits:
                     splits[id_] = ([], [])
-                k_ = 0 if spec.rewrite_type == CSGBRewriteType.SplitH else 1
+                k_ = 0 if spec.rewrite_type == URRewriteType.SplitH else 1
                 # only one split axis is allowed
                 if len(splits[id_][1 - k_]) > 0:
                     continue
                 splits[id_][k_].append(t)
                 # print(spec.rewrite_type, id_, t)
-            elif isinstance(spec, CSGBRewriteAddRect):
+            elif isinstance(spec, URRewriteAddRect):
                 x, y, s = spec.x, spec.y, spec.s
                 r, is_sub = spec.r, spec.is_sub
                 add_rects.append((x, y, s, r, is_sub))  # (x, y, s, r, is_sub)
                 # print(spec.rewrite_type, x, y, s, r, is_sub)
-            elif isinstance(spec, CSGBRewriteRemoveRect):
+            elif isinstance(spec, URRewriteRemoveRect):
                 id_ = spec.id_
                 if id_ in splits:
                     continue
@@ -564,7 +564,7 @@ class CSGB:
                 deleted.add(id_)
                 n_delete += 1
                 # print(spec.rewrite_type, id_)
-            elif isinstance(spec, CSGBRewriteMerge):
+            elif isinstance(spec, URRewriteMerge):
                 id1, id2 = spec.id1, spec.id2
                 if id1 in deleted or id2 in deleted or id1 in splits or id2 in splits:
                     continue
@@ -572,7 +572,7 @@ class CSGB:
                 deleted.add(id2)
                 merges[id1] = spec
                 # print(spec.rewrite_type, id1, id2)
-            elif isinstance(spec, CSGBRewriteAddHole):
+            elif isinstance(spec, URRewriteAddHole):
                 add_holes.append(spec)
             else:
                 raise ValueError(f"Unknown rewrite {spec}")
@@ -598,7 +598,7 @@ class CSGB:
                 new_is_subs.append(is_sub.unsqueeze(0))
                 continue
             txs, tys = splits[i]
-            new_xs_, new_sizes_, new_rots_ = _split_rect(xs, size, rot, txs, tys, csgb_args)
+            new_xs_, new_sizes_, new_rots_ = _split_rect(xs, size, rot, txs, tys, ur_args)
             new_xs.append(new_xs_)
             new_sizes.append(new_sizes_)
             new_rots.append(new_rots_)
@@ -624,7 +624,7 @@ class CSGB:
                     new_rots__[is_sub],
                     torch.tensor([x, y], device=device),
                     s,
-                    csgb_args,
+                    ur_args,
                 )
             new_xs = new_xs__
             new_sizes = new_sizes__
@@ -640,7 +640,7 @@ class CSGB:
             new_rots.append(torch.tensor([r], device=self.xs.device))
             new_is_subs.append(torch.tensor([is_sub], device=self.xs.device))
 
-        return CSGB(
+        return UR(
             xs=torch.cat(new_xs, dim=0),
             sizes=torch.cat(new_sizes, dim=0),
             rots=torch.cat(new_rots, dim=0),
@@ -648,7 +648,7 @@ class CSGB:
         )
 
     def _gen_merge_candidates(
-        self, lossy_threshold: float, csgb_args: CSGBCollectionArgs
+        self, lossy_threshold: float, ur_args: URColectionArgs
     ) -> tuple[list[tuple[int, int]], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         returns:
@@ -657,7 +657,7 @@ class CSGB:
         - size: (n_combs, 2)
         - rot: (n_combs,)
         """
-        return _gen_merge_candidates(self.xs, self.sizes, self.rots, self.is_subs, lossy_threshold, csgb_args)
+        return _gen_merge_candidates(self.xs, self.sizes, self.rots, self.is_subs, lossy_threshold, ur_args)
 
 
 def _split_rect(
@@ -666,7 +666,7 @@ def _split_rect(
     rot: torch.Tensor,
     txs: list[float],
     tys: list[float],
-    csgb_args: CSGBCollectionArgs,
+    ur_args: URColectionArgs,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     - center: (2,)
@@ -682,8 +682,8 @@ def _split_rect(
     """
     nx = len(txs)
     ny = len(tys)
-    cos_ = (rot * csgb_args.theta_scale).cos()
-    sin_ = (rot * csgb_args.theta_scale).sin()
+    cos_ = (rot * ur_args.theta_scale).cos()
+    sin_ = (rot * ur_args.theta_scale).sin()
     dx = torch.stack([cos_, sin_])
     dy = torch.stack([-sin_, cos_])
     txs.sort()
@@ -706,7 +706,7 @@ def _gen_merge_candidates(
     rots: torch.Tensor,
     is_subs: torch.Tensor,
     lossy_threshold: float,
-    csgb_args: CSGBCollectionArgs,
+    ur_args: URColectionArgs,
 ) -> tuple[list[tuple[int, int]], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     xs: (n_rects, 2)
@@ -733,8 +733,8 @@ def _gen_merge_candidates(
     is_, js_ = zip(*ij)
     is_ = list(is_)
     js_ = list(js_)
-    cos = (rots * csgb_args.theta_scale).cos()  # (n_rects,)
-    sin = (rots * csgb_args.theta_scale).sin()  # (n_rects,)
+    cos = (rots * ur_args.theta_scale).cos()  # (n_rects,)
+    sin = (rots * ur_args.theta_scale).sin()  # (n_rects,)
     dirx = torch.stack([cos, sin], dim=-1)  # (n_rects, 2)
     diry = torch.stack([-sin, cos], dim=-1)  # (n_rects, 2)
     dx = torch.tensor([-1, -1, 1, 1], device=device)  # (4,)
@@ -771,7 +771,7 @@ def _gen_merge_candidates(
 
     dij = pi.unsqueeze(-2) - pj.unsqueeze(-3)  # (n_combs, 4, 4, 2)
     test_angs1 = torch.atan2(dij[..., 1], dij[..., 0]).flatten(-2)  # (n_combs, 16)
-    test_angs2 = torch.stack([rots[is_], rots[js_]], dim=-1) * csgb_args.theta_scale  # (n_combs, 2)
+    test_angs2 = torch.stack([rots[is_], rots[js_]], dim=-1) * ur_args.theta_scale  # (n_combs, 2)
     test_angs = torch.cat([test_angs1, test_angs2], dim=-1)  # (n_combs, 18)
 
     test_cos = torch.cos(test_angs)  # (n_combs, 18)
@@ -810,7 +810,7 @@ def _gen_merge_candidates(
     area_gain = area_gain[mask]  # (n_masked,)
     mask = mask.tolist()
     ijs = [(is_[i], js_[i]) for i in range(len(is_)) if mask[i]]
-    return ijs, center, size, rot / csgb_args.theta_scale, area_gain
+    return ijs, center, size, rot / ur_args.theta_scale, area_gain
 
 
 def _punch_hole(
@@ -819,7 +819,7 @@ def _punch_hole(
     rots: torch.Tensor,
     pos: torch.Tensor,
     hole_r: float,
-    csgb_args: CSGBCollectionArgs,
+    ur_args: URColectionArgs,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     xs: (n_rects, 2)
@@ -833,8 +833,8 @@ def _punch_hole(
     - rots: (n_rects,)
     """
     diff = pos - xs  # (n_rects, 2)
-    cos_ = (rots * csgb_args.theta_scale).cos()  # (n_rects,)
-    sin_ = (rots * csgb_args.theta_scale).sin()  # (n_rects,)
+    cos_ = (rots * ur_args.theta_scale).cos()  # (n_rects,)
+    sin_ = (rots * ur_args.theta_scale).sin()  # (n_rects,)
     irot = torch.stack([cos_, sin_, -sin_, cos_], dim=-1).reshape(-1, 2, 2)  # (n_rects, 2, 2)
     diff_ = (irot @ diff.unsqueeze(-1)).squeeze(-1)  # (n_rects, 2)
     t_ = (diff_ + sizes.abs()) / (sizes.abs() * 2)  # (n_rects, 2)
@@ -857,7 +857,7 @@ def _punch_hole(
         ty = [y for y in [tminy, tmaxy] if 0 < y < 1]
         if len(tx) == 0 and len(ty) == 0:
             continue
-        c_xs, c_sizes, c_rots = _split_rect(xs[i_], sizes[i_], rots[i_], tx, ty, csgb_args)
+        c_xs, c_sizes, c_rots = _split_rect(xs[i_], sizes[i_], rots[i_], tx, ty, ur_args)
         # HEURISTIC: remove the region closest to the hole
         amin = int((c_xs - pos).norm(dim=-1).min(dim=0).indices.item())
         for j_ in range(len(c_xs)):
@@ -870,12 +870,12 @@ def _punch_hole(
     return torch.stack(xs_, dim=0), torch.stack(sizes_, dim=0), torch.stack(rots_, dim=0)
 
 
-def _always_raise() -> CSGBCollectionArgs:
-    raise ValueError("CSGBCollectionArgs must be set")
+def _always_raise() -> URColectionArgs:
+    raise ValueError("URCollectionArgs must be set")
 
 
 @dataclass
-class CSGBCollection(ObjectCollection[CSGB]):
+class URCollection(ObjectCollection[UR]):
     xs: torch.Tensor  # (tot_rects, 2)
     sizes: torch.Tensor  # (tot_rects, 2)
     rots: torch.Tensor  # (tot_rects,)
@@ -883,8 +883,8 @@ class CSGBCollection(ObjectCollection[CSGB]):
     index_of: torch.Tensor  # (tot_rects,) -> index of shapes
     indices: tuple[tuple[int, int], ...]  # [(n_rects, 2), ...] start, end for each shape
     ids: tuple[int, ...]
-    payloads: tuple[CSGBPayload, ...]
-    args: CSGBCollectionArgs = field(default_factory=_always_raise)
+    payloads: tuple[URPayload, ...]
+    args: URColectionArgs = field(default_factory=_always_raise)
 
     def __post_init__(self):
         assert self.xs.ndim == 2, f"xs must be a 2D tensor, got {self.xs.ndim}"
@@ -948,11 +948,11 @@ class CSGBCollection(ObjectCollection[CSGB]):
             args=self.args,
         )
 
-    def to(self, device: Union[str, torch.device, None] = None) -> "CSGBCollection":
+    def to(self, device: Union[str, torch.device, None] = None) -> "URCollection":
         """
         Detach and clone
         """
-        return CSGBCollection(
+        return URCollection(
             xs=self.xs.to(device=device),
             sizes=self.sizes.to(device=device),
             rots=self.rots.to(device=device),
@@ -964,9 +964,9 @@ class CSGBCollection(ObjectCollection[CSGB]):
             args=self.args,
         )
 
-    def get_object(self, idx: int, detach: bool = True) -> CSGB:
+    def get_object(self, idx: int, detach: bool = True) -> UR:
         s, e = self.indices[idx]
-        return CSGB(
+        return UR(
             xs=maybe_detach(self.xs[s:e, ...], detach),
             sizes=maybe_detach(self.sizes[s:e, ...], detach),
             rots=maybe_detach(self.rots[s:e], detach),
@@ -976,7 +976,7 @@ class CSGBCollection(ObjectCollection[CSGB]):
         )
 
     @classmethod
-    def from_object(cls, object: CSGB, **kwargs) -> "CSGBCollection":
+    def from_object(cls, object: UR, **kwargs) -> "URCollection":
         device = object.xs.device
         return cls(
             xs=object.xs.detach().clone(),
@@ -991,8 +991,8 @@ class CSGBCollection(ObjectCollection[CSGB]):
         )
 
     @classmethod
-    def cat(cls, collections: list[ObjectCollection[CSGB]], **kwargs) -> Self:
-        collections_ = cast(list[CSGBCollection], collections)
+    def cat(cls, collections: list[ObjectCollection[UR]], **kwargs) -> Self:
+        collections_ = cast(list[URCollection], collections)
         assert len(collections_) > 0, "collections must not be empty"
         n_shapes = 0
         n_rects = 0
@@ -1095,13 +1095,13 @@ class CSGBCollection(ObjectCollection[CSGB]):
         return torch.scatter_reduce(result, 0, self.index_of, self.sizes.abs().sum(dim=-1), reduce="sum")  # (n_shapes,)
 
     @classmethod
-    def patch_args(cls, args: CSGBCollectionArgs) -> Type["CSGBCollection"]:
+    def patch_args(cls, args: URColectionArgs) -> Type["URCollection"]:
         return type(
-            "CSGBCollectionWithArgs", (CSGBCollection,), {"__init__": partialmethod(CSGBCollection.__init__, args=args)}
+            "URCollectionWithArgs", (URCollection,), {"__init__": partialmethod(URCollection.__init__, args=args)}
         )
 
-    def to_savable(self) -> "CSGBCollection":
-        return CSGBCollection(
+    def to_savable(self) -> "URCollection":
+        return URCollection(
             xs=self.xs,
             sizes=self.sizes,
             rots=self.rots,

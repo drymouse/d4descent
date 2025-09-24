@@ -1,5 +1,4 @@
 import torch
-from ipycanvas import Canvas
 from typing import Optional, Union, overload, Iterable, TypedDict, Callable, TypeVar, Literal, Generic
 from IPython.display import display, Image
 from ipywidgets import Output
@@ -16,7 +15,7 @@ from collections.abc import Sequence
 import math
 
 
-from .objects.prim2 import Shape, vectorized_sample_arc, Line, Arc
+from .objects.arclines import Shape, vectorized_sample_arc, Line, Arc
 
 
 @dataclass
