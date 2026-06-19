@@ -21,7 +21,7 @@ def main():
     b.add("--optim.proposal_trigger", "step")
     b.add("--optim.propose_every", 25)
     b.add("--optim.proposal_size", 64)
-    b.add("--optim.n_steps", 5000)
+    b.add("--optim.n_steps", 500)
     b.add("--optim.stopping_patience", 25)
     b.add("--optim.batch_param_count", 8192)
     b.add("--optim.proposal_criterion", "loss")

@@ -14,7 +14,7 @@ dependencies = [
     "ipywidgets>=8.1.7",
     "kornia>=0.8.1",
     "matplotlib>=3.10.6",
-    "numpy>=2.3.3",
+    "numpy==2.2",
     "pillow>=11.3.0",
     "pyyaml>=6.0.2",
     "rich>=14.1.0",
