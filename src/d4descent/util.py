@@ -69,7 +69,16 @@ def setup_logging(args=None, log_level=None, reset=False):
 def seed_everything(seed):  # Set seed
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+    if torch.xpu.is_available():
+        torch.xpu.manual_seed(seed)
     random.seed(seed)
+
+
+def get_default_device() -> str:
+    """Selects the best available accelerator: CUDA, then CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
 _T = TypeVar("_T")

@@ -13,7 +13,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import Stabl
 from typing import Union
 import kornia.augmentation as K
 
-from ..util import setup_logging
+from ..util import setup_logging, get_default_device
 
 setup_logging()
 import logging
@@ -35,7 +35,7 @@ class StableDiffusion(nn.Module):
     def __init__(self, config: SdConfig = SdConfig(), device: Union[torch.device, str, None] = None):
         super().__init__()
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(get_default_device())
 
         logger.info(f"Loading Stable Diffusion ... from {self.config.pretrained_model_name_or_path}")
 

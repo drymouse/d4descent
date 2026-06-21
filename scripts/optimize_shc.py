@@ -17,7 +17,14 @@ install()  # Enable rich traceback
 from d4descent.tasks._base import Task, TaskArgs, RenderArgs
 from d4descent.losses._base import LossArgs
 from d4descent.objects.arclines import ShapeCollection, Shape, ShapeCollectionArgs
-from d4descent.util import torch_load, save_rgb8, save_video, read_points_npz, register_slurm_signal_handlers_auto
+from d4descent.util import (
+    torch_load,
+    save_rgb8,
+    save_video,
+    read_points_npz,
+    register_slurm_signal_handlers_auto,
+    get_default_device,
+)
 from d4descent.metrics import compute_metric
 from d4descent.optimizer import OptimizeArgs, optimize, OnVisualizeFunc
 
@@ -30,7 +37,7 @@ class Args:
     render: RenderArgs = field(default_factory=RenderArgs)
     target_points_path: Optional[Path] = None
     optim: OptimizeArgs = field(default_factory=OptimizeArgs)
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = get_default_device()
     restart: bool = False
     skip: int = 0
     until: Optional[int] = None
