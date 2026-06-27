@@ -190,8 +190,11 @@ class Tri:
         else:
             new_xs = self.xs.detach().clone()
 
-        for i in sorted(deleted, reverse=True):
-            new_xs = torch.cat([new_xs[:i], new_xs[i + 1 :]])
+        if deleted:
+            keep = torch.ones(len(new_xs), dtype=torch.bool, device=new_xs.device)
+            for i in deleted:
+                keep[i] = False
+            new_xs = new_xs[keep]
 
         return Tri(xs=new_xs)
 

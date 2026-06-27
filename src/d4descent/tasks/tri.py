@@ -12,6 +12,9 @@ from ..objects.tri import (
     TriRewriteArgs,
     TriRewriteType,
     TriRewrite,
+    TriRewriteAddTri,
+    TriRewriteRemoveTri,
+    TriPayload,
     TriColectionArgs,
     # CleanStrategy,
 )
@@ -94,10 +97,67 @@ class TriTask(Task[Tri, TriRewrite, StateT]):
         specs = obj.gen_rewrite_specs(
             self.args.rewrite_args, num_rewrites=num_proposals, lim=self.render_args.lim, tri_args=self.args.tri_args
         )
-        rewritten: list[Tri] = []
-        for spec in specs:
-            rewritten.append(obj.apply_rewrite(spec, self.args.tri_args))
-        return self._Collection.from_objects(rewritten), specs
+
+        device = obj.xs.device
+        dtype = obj.xs.dtype
+        n_base = obj.xs.shape[0]
+        xs_base = obj.xs.detach()
+
+        add_specs = [s for s in specs if isinstance(s, TriRewriteAddTri)]
+        remove_specs = [s for s in specs if isinstance(s, TriRewriteRemoveTri)]
+
+        sub_collections: list[TriCollection] = []
+        ordered_specs: list[TriRewrite] = []
+        ctx = Context.get()
+
+        if add_specs:
+            n_add = len(add_specs)
+            # 全 AddTri の頂点を一括テンソル化（CPU→GPU 転送は1回だけ）
+            new_verts = torch.tensor(
+                [[[s.x1, s.y1], [s.x2, s.y2], [s.x3, s.y3]] for s in add_specs],
+                device=device, dtype=dtype,
+            )  # (n_add, 3, 2)
+            n_each = n_base + 1
+            # 元の三角形群を n_add 回展開して末尾に1枚ずつ追加
+            xs_expanded = xs_base.unsqueeze(0).expand(n_add, -1, -1, -1)  # (n_add, n_base, 3, 2)
+            xs_all = torch.cat([xs_expanded, new_verts.unsqueeze(1)], dim=1)  # (n_add, n_each, 3, 2)
+            xs_flat = xs_all.reshape(-1, 3, 2)  # (n_add * n_each, 3, 2)
+            index_of = torch.arange(n_add, device=device).repeat_interleave(n_each)
+            sub_collections.append(self._Collection(
+                xs=xs_flat,
+                index_of=index_of,
+                indices=tuple((i * n_each, (i + 1) * n_each) for i in range(n_add)),
+                ids=tuple(ctx.gen_id() for _ in range(n_add)),
+                payloads=tuple(TriPayload() for _ in range(n_add)),
+            ))
+            ordered_specs.extend(add_specs)
+
+        if remove_specs:
+            n_remove = len(remove_specs)
+            n_each = n_base - 1
+            # 削除インデックスをベクトル化してマスクを一括生成
+            remove_ids_t = torch.tensor([s.id_ for s in remove_specs], device=device)  # (n_remove,)
+            all_idx = torch.arange(n_base, device=device)
+            keep_mask = all_idx.unsqueeze(0) != remove_ids_t.unsqueeze(1)  # (n_remove, n_base)
+            keep_indices = all_idx.unsqueeze(0).expand(n_remove, -1)[keep_mask].reshape(n_remove, n_each)
+            # gather で各提案の残存三角形を一括取得
+            gather_idx = keep_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3, 2)
+            xs_rem = xs_base.unsqueeze(0).expand(n_remove, -1, -1, -1)
+            xs_flat_r = torch.gather(xs_rem, 1, gather_idx).reshape(-1, 3, 2)  # (n_remove * n_each, 3, 2)
+            index_of_r = torch.arange(n_remove, device=device).repeat_interleave(n_each)
+            sub_collections.append(self._Collection(
+                xs=xs_flat_r,
+                index_of=index_of_r,
+                indices=tuple((i * n_each, (i + 1) * n_each) for i in range(n_remove)),
+                ids=tuple(ctx.gen_id() for _ in range(n_remove)),
+                payloads=tuple(TriPayload() for _ in range(n_remove)),
+            ))
+            ordered_specs.extend(remove_specs)
+
+        if not sub_collections:
+            return self._Collection.from_objects([obj]), []
+
+        return self._Collection.cat(sub_collections), ordered_specs
 
     def make_proposals(self, obj: Tri) -> tuple[ObjectCollection[Tri], list[TriRewrite]]:
         raise NotImplementedError()
