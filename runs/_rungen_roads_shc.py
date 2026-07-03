@@ -18,12 +18,15 @@ def main():
     b.add("--task.cost_weight", 1e-3)
     b.add("--task.cost_width_exponent", 2.5)  # 幹線道路(幅広)への罰則を幅に対して超線形に強くする
     b.add("--task.mesh_weight", 0.05)  # ループ形成(meshedness)への報酬。都市らしい街区構造を促す
+    b.add("--task.min_angle", math.radians(45))  # RoadArgs.min_angle はラジアン
+    b.add("--task.angle_penalty_exponent", 2.0)
+    b.add("--task.angle_weight", 0.02)  # 交差点が鋭角になりすぎることへの罰則
     b.add("--task.road_collection_args.sigma0", 0.03)
     b.add("--task.road_collection_args.k_sigma", 300.0)
     b.add("--task.road_collection_args.reach_exponent", 2.5)  # 幹線道路の到達半径を不釣り合いに拡大
     b.add("--task.road_collection_args.amp_scale", 0.045)  # 幹線道路=薄く広く、街路=狭く大きく
     b.add("--task.road_collection_args.min_density_floor", 0.05)  # 道路が無くても保証される絶対的な最低ライン
-    b.add("--task.target_inside_value", 0.7)  # shcの形状の内側(市街地)の目標密度
+    b.add("--task.target_inside_value", 0.7)  # shcの形状の内側(市街地)の目標密度。pngs版と揃える
     b.add("--task.target_outside_value", 0.15)  # 形状の外側にも目標密度を持たせ、幹線道路が伸びる動機にする
     b.add("--task.rewrite_args.width_classes", [0.02, 0.05])
     b.add("--task.rewrite_args.length_range", [0.05, 0.15])

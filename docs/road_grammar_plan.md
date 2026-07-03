@@ -196,6 +196,21 @@ simplicity = cost * cost_weight - meshedness * mesh_weight
 
 数値確認済み: V=4のノード集合で木構造(E=3)は`simplicity`寄与≈+4.6e-7（ほぼ0）だが、そこに1本足してループを作る(E=4)と`simplicity`寄与≈-0.0167（エッジが1本増えてコストは上がっているのに、meshedness報酬がそれを大きく上回り正味で有利になる）。
 
+## 4.2 都市らしさの評価軸：交差点の角度（鋭角の罰則）
+
+密度一致・コスト・meshednessだけでは道路の**向き**に選好がなく、交差点で道路同士がほぼ同じ方向を向いて鋭角に交わる（針のような不自然な形状）ことがある。これを罰するため、各ノードで接続する道路の方向を角度順に並べ、隣接方向どうしの角度差(gap)が閾値を下回った分だけ罰則を与える。
+
+```
+各ノードの周りの道路の方向を角度順に並べる (次数dなら d個のgapがあり、合計は必ず2π)
+gap_i が min_angle を下回ったら (min_angle - gap_i)^angle_penalty_exponent だけ罰する
+```
+
+`RoadNetworkCollection.get_angle_penalty(min_angle, exponent)` として実装。ソートは `(center_node, theta)` の複合キーで一括 `argsort` し、隣接差分から"内部gap"を求め、周回分の最後のgapは `2π - 内部gapの総和` として計算する（ノードごとの明示的なループを避け、`scatter_add`/`scatter_reduce` だけで完結させている）。
+
+他の正則化（コスト・meshedness）は `compute_simplicity`（離散書き換えの採否にのみ影響）に入れているが、**角度罰則は `_compute_losses` に直接加算する**——連続最適化（勾配降下）でノード位置そのものを動かして角度を改善してほしいため。次数1以下のノード（角度が定義できない）は対象外。
+
+数値検証済み: 中心ノードから10°で開く2本の道 vs 90°で開く2本の道を比較（`min_angle=45°`）——鋭角側は罰則≈0.373、広角側は罰則=0（45°を超えているため）。勾配も正しく流れ、鋭角の枝を開く方向に力がかかることを確認した。
+
 ## 5. `TaskArgs`（想定フィールド）
 
 `RoadCollectionArgs`（密度・SDFの計算に使う。`RoadTask` 経由で `patch_args` される）:
@@ -217,6 +232,7 @@ simplicity = cost * cost_weight - meshedness * mesh_weight
 | `cost_weight` | 建設コスト正則化の重み | `Tri.node_weight` に相当 |
 | `cost_width_exponent` | 建設コストの幅に対する指数 | 1より大きいほど幹線道路への罰則が強くなる |
 | `mesh_weight` | ループ形成(meshedness)への報酬の重み | 4.1節。大きいほどSnapによるループ化を優先する |
+| `min_angle` / `angle_penalty_exponent` / `angle_weight` | 交差点の角度が小さすぎることへの罰則 | 4.2節。`min_angle` はラジアン（デフォルト `math.radians(45)`）。`_compute_losses` に直接加算 |
 | `snap_radius` | スナップ候補とみなす最大距離（グリッドのセルサイズにも使う） | |
 | `default_length` / `length_range` | Add系書き換えの新規エッジ長 | |
 | `add_weight` / `add_free_weight` | `AddFromNode`/`AddFree` の候補数に比例した重み | `n_candidates * weight` 個の候補を生成する。値を下げると相対的にその書き換えが選ばれにくくなる |

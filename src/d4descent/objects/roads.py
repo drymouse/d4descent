@@ -601,6 +601,14 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
     def get_sizes(self) -> list[int]:
         return [e - s for s, e in self.edge_ranges]
 
+    def _build_node_index_of(self) -> torch.Tensor:
+        """各ノード(グローバルindex)がどのネットワーク(=object)に属するかを返す。 (total_nodes,)"""
+        device = self.device()
+        node_index_of = torch.empty(len(self.nodes), dtype=torch.long, device=device)
+        for i, (s, e) in enumerate(self.node_ranges):
+            node_index_of[s:e] = i
+        return node_index_of
+
     def get_meshedness(self) -> torch.Tensor:
         """
         道路網のループ(閉路)の多さを 0〜1 程度で表す指標（meshedness / alpha index）。
@@ -618,9 +626,7 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
         degree.scatter_add_(0, self.edges.flatten(), torch.ones(2 * len(self.edges), dtype=torch.long, device=device))
         live = (degree > 0).float()
 
-        node_index_of = torch.empty(n_total_nodes, dtype=torch.long, device=device)
-        for i, (s, e) in enumerate(self.node_ranges):
-            node_index_of[s:e] = i
+        node_index_of = self._build_node_index_of()
 
         v = torch.scatter_reduce(
             torch.zeros(n_networks, device=device), 0, node_index_of, live, reduce="sum"
@@ -630,6 +636,65 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
         cycles = (e - v + 1).clamp(min=0.0)
         denom = (2 * v - 5).clamp(min=1.0)
         return cycles / denom
+
+    def get_angle_penalty(self, min_angle: float, exponent: float = 2.0) -> torch.Tensor:
+        """
+        各ノードにおいて、そこに接続する道路同士の"隣接する"方向間の角度差(gap)が min_angle を
+        下回った分だけ (min_angle - gap)^exponent で罰する。鋭角に交わる不自然な交差点を減らし、
+        適度に開いた(=都市の道路網らしい)交差点を促す。次数1以下のノードは角度が定義できないため対象外。
+
+        ノード周りの各方向を角度順に並べたときの隣接gap(最後尾から先頭に戻る周回分も含む)を
+        すべて求める。次数dのノードには合計d個のgapがあり、その総和は必ず2πになる。
+
+        returns: (n_networks,)
+        """
+        device = self.device()
+        total_nodes = len(self.nodes)
+        n_networks = len(self.ids)
+        n_edges = len(self.edges)
+        if n_edges == 0:
+            return torch.zeros(n_networks, device=device)
+
+        center = torch.cat([self.edges[:, 0], self.edges[:, 1]])  # (2E,)
+        other = torch.cat([self.edges[:, 1], self.edges[:, 0]])  # (2E,)
+        vec = self.nodes[other] - self.nodes[center]  # (2E, 2)
+        two_pi = 2 * math.pi
+        theta = torch.remainder(torch.atan2(vec[:, 1], vec[:, 0]), two_pi)  # [0, 2pi)
+
+        # (center, theta) の順でソートすると、同一ノードに属する方向が角度順に並ぶ
+        key = center.to(theta.dtype) * (two_pi + 1.0) + theta
+        order = torch.argsort(key)
+        center_sorted = center[order]
+        theta_sorted = theta[order]
+
+        diffs = theta_sorted[1:] - theta_sorted[:-1]  # (2E-1,)
+        same_group = center_sorted[1:] == center_sorted[:-1]  # 同じノードに属する隣接ペアか
+        node_of_gap = center_sorted[:-1]  # (2E-1,)
+
+        # 周回ギャップ = 2π - (そのノードの"内部"gapの総和)
+        intra_gap = torch.where(same_group, diffs, torch.zeros_like(diffs))
+        sum_intra = torch.zeros(total_nodes, dtype=theta.dtype, device=device)
+        sum_intra.scatter_add_(0, node_of_gap, intra_gap)
+        wrap_gap = (two_pi - sum_intra).clamp(min=0.0)  # (total_nodes,)
+
+        degree = torch.zeros(total_nodes, dtype=torch.long, device=device)
+        degree.scatter_add_(0, self.edges.flatten(), torch.ones(2 * n_edges, dtype=torch.long, device=device))
+        has_gaps = degree >= 2
+
+        intra_penalty = torch.where(
+            same_group, (min_angle - diffs).clamp(min=0.0).pow(exponent), torch.zeros_like(diffs)
+        )
+        wrap_penalty = torch.where(
+            has_gaps,
+            (min_angle - wrap_gap).clamp(min=0.0).pow(exponent),
+            torch.zeros(total_nodes, dtype=theta.dtype, device=device),
+        )
+
+        node_index_of = self._build_node_index_of()
+        result = torch.zeros(n_networks, dtype=theta.dtype, device=device)
+        result = torch.scatter_reduce(result, 0, node_index_of[node_of_gap], intra_penalty, reduce="sum")
+        result = torch.scatter_reduce(result, 0, node_index_of, wrap_penalty, reduce="sum")
+        return result
 
     @classmethod
     def patch_args(cls, args: RoadCollectionArgs) -> Type["RoadNetworkCollection"]:

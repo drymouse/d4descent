@@ -1,3 +1,4 @@
+import math
 import random
 from dataclasses import dataclass, field
 from typing import Optional, Union
@@ -36,6 +37,12 @@ class RoadArgs(TaskArgs):
     # ロジックで解釈する。
     target_inside_value: float = 0.7
     target_outside_value: float = 0.15
+    # 交差点の角度が小さすぎる(道路同士がほぼ同じ方向を向いて鋭角に交わる)ことへの罰則。
+    # (min_angle - 実際の角度)^angle_penalty_exponent を連続損失に直接加算する
+    # (離散書き換えの採否・連続最適化どちらにも効かせるため compute_simplicity ではなく loss 側に入れる)。
+    min_angle: float = math.radians(45)
+    angle_penalty_exponent: float = 2.0
+    angle_weight: float = 0.02
     better_abs_eps: float = 1e-8
     rewrite_args: RoadRewriteArgs = field(default_factory=RoadRewriteArgs)
     road_collection_args: RoadCollectionArgs = field(default_factory=RoadCollectionArgs)
@@ -284,6 +291,8 @@ class RoadDensityTask(RoadTask[None]):
         # 最低ラインは compute_density 側で無条件保証済み（density は floor を下回らない）ので、
         # ここでは素直に target とのMSEのみでよい。
         loss = (density - self.target_img).square().flatten(-2).mean(dim=-1)
+        angle_penalty = collection.get_angle_penalty(self.args.min_angle, self.args.angle_penalty_exponent)
+        loss = loss + self.args.angle_weight * angle_penalty
         return loss, {}
 
     def visualize(self, collection: ObjectCollection[RoadNetwork], step: int, loss: float, state: None) -> np.ndarray:

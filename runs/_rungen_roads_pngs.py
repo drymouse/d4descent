@@ -19,6 +19,9 @@ def main():
     b.add("--task.cost_weight", 1e-3)
     b.add("--task.cost_width_exponent", 2.5)  # 幹線道路(幅広)への罰則を幅に対して超線形に強くする
     b.add("--task.mesh_weight", 0.05)  # ループ形成(meshedness)への報酬。都市らしい街区構造を促す
+    b.add("--task.min_angle", math.radians(45))  # RoadArgs.min_angle はラジアン
+    b.add("--task.angle_penalty_exponent", 2.0)
+    b.add("--task.angle_weight", 0.02)  # 交差点が鋭角になりすぎることへの罰則
     b.add("--task.road_collection_args.sigma0", 0.03)
     b.add("--task.road_collection_args.k_sigma", 300.0)
     b.add("--task.road_collection_args.reach_exponent", 2.5)  # 幹線道路の到達半径を不釣り合いに拡大
