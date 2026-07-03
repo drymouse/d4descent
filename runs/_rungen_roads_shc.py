@@ -8,10 +8,9 @@ GEN_DIR = folder = Path(__file__).parent / "_generated"
 
 
 def main():
-    b = CLIBuilder("Road-F")
+    b = CLIBuilder("Road")
     b.add("--save_path", "output/###JOB_NAME###")
     b.add("--render.blur", 1 / math.sqrt(2))
-    b.add("--img_mode", "bow")  # 画像の黒(ロゴ/市街地)=高密度になるよう反転する
     # loss (target_img のロード経路のみ流用。損失自体は RoadDensityTask のカスタム実装)
     b.add("---loss", "configs/losses/raster.yaml")
     # task
@@ -24,8 +23,8 @@ def main():
     b.add("--task.road_collection_args.reach_exponent", 2.5)  # 幹線道路の到達半径を不釣り合いに拡大
     b.add("--task.road_collection_args.amp_scale", 0.045)  # 幹線道路=薄く広く、街路=狭く大きく
     b.add("--task.road_collection_args.min_density_floor", 0.05)  # 道路が無くても保証される絶対的な最低ライン
-    b.add("--task.target_inside_value", 0.7)  # 画像の高輝度側(市街地)の目標密度
-    b.add("--task.target_outside_value", 0.15)  # 画像の低輝度側にも目標密度を持たせ、幹線道路が伸びる動機にする
+    b.add("--task.target_inside_value", 0.7)  # shcの形状の内側(市街地)の目標密度
+    b.add("--task.target_outside_value", 0.15)  # 形状の外側にも目標密度を持たせ、幹線道路が伸びる動機にする
     b.add("--task.rewrite_args.width_classes", [0.02, 0.05])
     b.add("--task.rewrite_args.length_range", [0.05, 0.15])
     b.add("--task.rewrite_args.snap_radius", 0.05)
@@ -47,16 +46,23 @@ def main():
     # script
     b.add("--restart", False)
 
+    # shc は複数のターゲット形状を含む（ArcLinesのベンチマーク用データを密度マップとして流用）。
+    # 手早く試すだけなら生成後のシェルスクリプトに "--until 1" 等を足して1件だけ処理させるとよい。
     b.add_sweep_set(
         {
-            # TODO: 実際の人口密度マップに差し替える（白=高密度のグレースケール画像フォルダ）
-            "_SIGLOGO": {
-                "--png_path": "data/pngs/siglogo",
+            "_OneComp": {
+                "--target_points_path": "data/arclines/bench128.shc",
+            },
+            "_Donut": {
+                "--target_points_path": "data/arclines/donut25.shc",
+            },
+            "_TwoComp": {
+                "--target_points_path": "data/arclines/twocomp23.shc",
             },
         }
     )
 
-    gen_dir = GEN_DIR / "roads_pngs"
+    gen_dir = GEN_DIR / "roads_shc"
     if gen_dir.exists():
         shutil.rmtree(gen_dir)
     gen_dir.mkdir(exist_ok=True, parents=True)
@@ -64,7 +70,7 @@ def main():
     for name, args, _ in b.build():
         file = gen_dir / f"{name}.sh"
         script = (
-            f"#!/bin/bash\n\ncd {PROJ_DIR}\nuv run python scripts/optimize_pngs.py \\\n\t" + " \\\n\t".join(args) + "\n"
+            f"#!/bin/bash\n\ncd {PROJ_DIR}\nuv run python scripts/optimize_shc.py \\\n\t" + " \\\n\t".join(args) + "\n"
         )
         script = script.replace("###JOB_NAME###", name)
         file.write_text(script)

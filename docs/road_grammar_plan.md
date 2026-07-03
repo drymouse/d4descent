@@ -104,7 +104,19 @@ Snap は「次数1の“ぶら下がった”端点」ごとに、半径 `snap_r
 
 ## 3. 目的関数：人口密度の合成（カスタム `_compute_losses`）
 
-`RasterLossMixin`（二値占有率のMSE）はそのまま使わず、道路網から人口密度場を合成するforward modelを自作する。ただし **target の入力形式は raster タスク（`_pngs`）と同じ `[0,1]` の画像（`target_img`）をそのまま人口密度マップとして扱う**（専用の正規化パイプラインは用意しない）。
+`RasterLossMixin`（二値占有率のMSE）はそのまま使わず、道路網から人口密度場を合成するforward modelを自作する。target の入力経路自体は raster タスク（`_pngs`）や `_shc` と同じ `[0,1]` の画像（`target_img`）をそのまま流用するが、**値そのものは `target_inside_value`/`target_outside_value` で実際の密度レンジへアフィン変換してから使う**（3.0節）。
+
+### 3.0 target値のレンジ変換（pngs・shc共通）
+
+`target_img` は入力元（PNG画像 or `ShapeCollection.render01()`）によらず `[0,1]` に近い値で渡ってくるが、これを人口密度としてそのまま使うと「形状の中=1(最大密度)、外=0(密度ゼロ)」という極端な二値になりやすい（shcの場合は`render01`がほぼ厳密な二値、pngsでも黒背景/白背景の画像だと同様）。特に外側が厳密に0だと、そこに道路を敷く動機が一切生まれない（道路を敷くとtarget=0との誤差がむしろ増える）。
+
+そこで `RoadDensityTask.__init__` で必ず次のアフィン変換を適用する（pngs・shcのどちらでも同じロジック）:
+
+```
+effective_target = target_outside_value + (target_inside_value - target_outside_value) * target_img
+```
+
+デフォルトは `target_inside_value=0.7`, `target_outside_value=0.15`——形状の外側にも非ゼロの目標密度を持たせることで、そこにも(幹線道路程度の疎な)道路網が伸びる動機を作る。この変換は常に適用される標準の仕組みであり、「二値のまま使う」という特別扱いは無い（`target_inside_value=1, target_outside_value=0` にすれば従来の二値相当に戻せるが、それを既定にはしない）。
 
 ### 3.1 エッジごとの被覆度
 
@@ -127,33 +139,35 @@ density(x) = max_e c_e(x)
 
 `scatter_reduce(..., reduce="amax")` で実装する（`amin`ベースの`rasterize`と対称的な形）。この方式なら、ある点が幹線道路の直上（距離0）にあっても、少し離れた街路の`c_e`の方が大きければ、街路の値が採用される。実際に検証済み: 幹線道路の内側(dist=0, c_e≈0.23)にいても、0.05離れた街路(c_e≈0.31)の方が値が大きければ街路が採用されることを数値確認した。
 
-### 3.3 最低ライン（当初案から変更）
+### 3.3 最低ライン（"保証" vs "罰則" の間で1往復した）
 
-当初は `density_pred = baseline + (1 - baseline) * raw(x)` として forward model に無条件で加算していたが、これだと `density_pred` が数式上 `baseline` を下回ることが絶対にできず、「最低ラインを下回った場合のペナルティ」を追加しようにも常にゼロになってしまう（実際に運用してみて気づいた設計ミス）。
+最低ラインの実装は以下の経緯で2転した:
 
-そこで **`compute_density` は `raw(x)` をそのまま返す**（無条件の下駄を廃止）。最低ラインは損失側の非対称な罰則として実装する:
+1. **最初の案**: `density = baseline + (1 - baseline) * raw(x)` として forward model に無条件加算。しかし `density` が数式上 `baseline` を絶対に下回れず、「下回った場合のペナルティ」を追加しようにも常にゼロになる問題があった。
+2. **2番目の案**: 無条件加算をやめ、`compute_density` は `raw(x)` をそのまま返し、代わりに損失側で `underflow_weight * relu(min_density_floor - density)^2` という非対称な罰則を課した。しかしこれは**保証にならない**——道路が届かない場所（背景など）で床を満たすにはそこまで道路を敷く必要がありコストが見合わないため、実際にはモデルは罰則を払うだけで済ませてしまい、密度はほぼ0のまま放置される。ユーザーからの指摘で発覚。
+3. **最終案（現在）**: 「保証」を優先し、`compute_density` の出力に対して無条件の下限を再度課す。ただし複数エッジの合成が「最大値」方式（3.2節）になったことに合わせて、加算ではなく `max` で床を適用する:
 
 ```
-mse(x)       = (density(x) - target(x))^2
-underflow(x) = relu(min_density_floor - density(x))^2   # 床を下回った分だけ二乗で罰する。targetの値によらない
-loss(x)      = mse(x) + underflow_weight * underflow(x)
+raw(x)     = max_e c_e(x)
+density(x) = max(raw(x), min_density_floor)
 ```
 
-- `min_density_floor` / `underflow_weight` は `RoadArgs`（Task側）のフィールド。`RoadCollectionArgs` からは `baseline_density` を削除した
-- こうすることで「最低ラインを上げる」(`min_density_floor` を上げる)と「下回った時のペナルティを強める」(`underflow_weight` を上げる)を独立に制御できる
+`min_density_floor` は `RoadCollectionArgs`（`compute_density` を計算する場所）に戻した。この形であれば `density` は数式上どんな状況でも `min_density_floor` を下回れないため、真の意味で「保証」になる。損失側の非対称罰則（`underflow_weight`）は不要になったため削除し、通常のMSEに戻した。
+
+**教訓**: 「無条件で下回れない」＝保証、「下回ったら罰則」＝ソフトな目標、は両立しない概念。今回のように「道路が届かない場所ではコストが見合わず罰則を払うだけで済ませられる」ケースでは、ソフトな罰則では実質的に機能しない。保証したいなら無条件の下限（`clamp`/`max`）を使うべき。
+
+**`min_density_floor` だけでは「街の外側にも道路を敷きたい」は実現できない点に注意**: `min_density_floor` は道路の有無に関わらず無条件で保証される値なので、これ単体では道路網に「外側にも道路を敷こう」という動機を一切与えない（道路を敷いてもこの保証値は変わらず、target=0の場所ではむしろ悪化する）。「外側にも道路を敷いてほしい」という要求には、3.0節の `target_outside_value` のように **target自体を底上げする**必要がある。`min_density_floor`（forward modelの無条件保証・道路非依存）と `target_outside_value`（targetの底上げ・道路を敷く動機を作る）は役割が異なる、独立した2つの仕組み。
 
 ### 3.4 損失
 
 ```python
 def _compute_losses(self, collection, state):
-    density = collection.compute_density(size, lim, center_pixel)  # (n_networks, size, size)
-    mse = (density - self.target_img).square()
-    underflow = (self.args.min_density_floor - density).clamp(min=0.0).square()
-    loss = (mse + self.args.underflow_weight * underflow).flatten(-2).mean(dim=-1)
+    density = collection.compute_density(size, lim, center_pixel)  # (n_networks, size, size)。floor保証済み
+    loss = (density - self.target_img).square().flatten(-2).mean(dim=-1)
     return loss, {}
 ```
 
-`compute_density` は `rasterize`（`amin`集約、可視化・境界判定用）とは別のメソッドとして `RoadNetworkCollection` に実装する（集約方法が `amin` ではなく「和→飽和」のため）。ただしエッジごとのカプセルSDF計算自体は両者で共通化できる。`self.target_img` は既存の raster タスクと同じ仕組み（`RasterLossArgs`/`target_img` 経由）でロードした `[0,1]` 画像をそのまま使う。**`img_mode` は `bow`（黒=前景を高密度として反転）を使うこと** — `wob` のままだと画像の余白（背景）が高密度、ロゴ/市街地形状が低密度に読み込まれ、意図と正反対になる。
+`compute_density` は `rasterize`（`amin`集約、可視化・境界判定用）とは別のメソッドとして `RoadNetworkCollection` に実装する（集約方法が `amin` ではなく「街路/幹線道路のうち寄与最大のものを採用＋床でclamp」のため）。ただしエッジごとのカプセルSDF計算自体は両者で共通化できる。`self.target_img` は既存の raster タスクと同じ仕組み（`RasterLossArgs`/`target_img` 経由）でロードした `[0,1]` 画像をそのまま使う。**`img_mode` は `bow`（黒=前景を高密度として反転）を使うこと** — `wob` のままだと画像の余白（背景）が高密度、ロゴ/市街地形状が低密度に読み込まれ、意図と正反対になる。
 
 ## 4. 正則化（複雑さ＝建設コスト）
 
@@ -184,15 +198,22 @@ simplicity = cost * cost_weight - meshedness * mesh_weight
 
 ## 5. `TaskArgs`（想定フィールド）
 
+`RoadCollectionArgs`（密度・SDFの計算に使う。`RoadTask` 経由で `patch_args` される）:
+
 | パラメータ | 意味 | 備考 |
 |---|---|---|
-| `width_classes` | 選択可能な道路幅の離散値一覧 | 例: `(0.02, 0.05)`。Add系書き換えで各値を提案 |
 | `sigma0` | 最小到達半径（street相当） | 密度合成カーネルの基準スケール |
 | `k_sigma` | 幅→到達範囲の係数 | highway ほど広域に効くようにする |
 | `reach_exponent` | 到達半径の幅に対する指数 | 1より大きいほど幹線道路の到達範囲だけ不釣り合いに拡大する |
 | `amp_scale` | ピーク強度の基準スケール（`amplitude_e = amp_scale/sigma_e`） | 到達範囲が広いほどピークが下がる |
-| `min_density_floor` | 人口密度の最低ライン | 損失側の非対称罰則（3.3節）で使う。forward modelには焼き込まない |
-| `underflow_weight` | 最低ラインを下回った分への追加罰則の重み | 大きいほど床割れを強く嫌う |
+| `min_density_floor` | 人口密度の絶対的な最低ライン | `compute_density` で `max` によって無条件保証（3.3節）。道路が無くても保証される値なので、通常は `target_outside_value` より低く設定する |
+
+`RoadArgs`（Task側）:
+
+| パラメータ | 意味 | 備考 |
+|---|---|---|
+| `width_classes` | 選択可能な道路幅の離散値一覧 | 例: `(0.02, 0.05)`。Add系書き換えで各値を提案 |
+| `target_inside_value` / `target_outside_value` | `target_img` を実際の密度値へアフィン変換する際の範囲 | 3.0節。デフォルト `0.7`/`0.15`（pngs・shc共通） |
 | `cost_weight` | 建設コスト正則化の重み | `Tri.node_weight` に相当 |
 | `cost_width_exponent` | 建設コストの幅に対する指数 | 1より大きいほど幹線道路への罰則が強くなる |
 | `mesh_weight` | ループ形成(meshedness)への報酬の重み | 4.1節。大きいほどSnapによるループ化を優先する |

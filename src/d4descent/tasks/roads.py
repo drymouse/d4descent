@@ -29,8 +29,13 @@ class RoadArgs(TaskArgs):
     cost_weight: float = 1e-3  # 建設コスト(長さ×幅^cost_width_exponent)の正則化重み。Triのnode_weightに相当
     cost_width_exponent: float = 2.0  # 幅への指数。1より大きいほど幹線道路(幅広)への罰則が超線形に強くなる
     mesh_weight: float = 0.05  # ループ形成(meshedness)への報酬の重み。大きいほどSnapでのループ化を優先する
-    min_density_floor: float = 0.15  # 人口密度の最低ライン
-    underflow_weight: float = 4.0  # 最低ラインを下回った分への追加罰則の重み（下回るほど二乗で効く）
+    # target_img（[0,1]の画像やshcのrender01など、入力元によらず同じ扱い）を実際の密度値にアフィン変換する:
+    #   effective_target = target_outside_value + (target_inside_value - target_outside_value) * target_img
+    # 0/1 に張り付いた値をそのまま目標にはしない。街の外側にも最低限の目標密度(target_outside_value)を
+    # 持たせることで、そこにも(幹線道路程度の)道路が伸びる動機を作る。pngs・shcのどちらの入力でも同じ
+    # ロジックで解釈する。
+    target_inside_value: float = 0.7
+    target_outside_value: float = 0.15
     better_abs_eps: float = 1e-8
     rewrite_args: RoadRewriteArgs = field(default_factory=RoadRewriteArgs)
     road_collection_args: RoadCollectionArgs = field(default_factory=RoadCollectionArgs)
@@ -262,7 +267,9 @@ class RoadTask(Task[RoadNetwork, RoadRewrite, StateT]):
 class RoadDensityTask(RoadTask[None]):
     def __init__(self, args: RoadArgs, render_args: RenderArgs, target_img: torch.Tensor):
         RoadTask.__init__(self, args, render_args, target_img.device)
-        self.target_img = target_img
+        # target_img（pngs/shcどちらの入力元でも）を target_inside_value/target_outside_value の範囲へ
+        # アフィン変換する。以降はこの変換済みの値を target として扱う。
+        self.target_img = args.target_outside_value + (args.target_inside_value - args.target_outside_value) * target_img
 
     def initialize_state(self) -> None:
         return None
@@ -274,10 +281,9 @@ class RoadDensityTask(RoadTask[None]):
         density = collection.compute_density(
             self.render_args.size, self.render_args.lim, center_pixel=self.render_args.center_pixel
         )  # (n_networks, size, size)
-        mse = (density - self.target_img).square()
-        # 最低ラインを下回った分だけ二乗で追加罰則（target側の値に関わらず、床を下回ること自体を罰する）
-        underflow = (self.args.min_density_floor - density).clamp(min=0.0).square()
-        loss = (mse + self.args.underflow_weight * underflow).flatten(-2).mean(dim=-1)
+        # 最低ラインは compute_density 側で無条件保証済み（density は floor を下回らない）ので、
+        # ここでは素直に target とのMSEのみでよい。
+        loss = (density - self.target_img).square().flatten(-2).mean(dim=-1)
         return loss, {}
 
     def visualize(self, collection: ObjectCollection[RoadNetwork], step: int, loss: float, state: None) -> np.ndarray:

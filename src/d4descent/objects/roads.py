@@ -362,8 +362,9 @@ class RoadCollectionArgs:
     amp_scale: float = 0.05  # ピーク強度 = amp_scale / sigma_e (<=1)。sigma(=到達半径)が広いほどピークが下がる
     # amp_scale と sigma_e から決まるピーク強度により、幹線道路(幅広->sigma大)は「薄く広く」、
     # 街路(幅狭->sigma小)は「狭く大きく」効くようにする(断面積 amplitude*sigma がほぼ一定になる)。
-    # 「最低密度」は forward model に無条件で焼き込まない（下回っても損失が発生しなくなるため）。
-    # 代わりに RoadArgs.min_density_floor / underflow_weight で損失側の罰則として与える。
+    min_density_floor: float = 0.15  # 人口密度の最低ライン。道路の有無によらず無条件で保証する（max で合成）。
+    # 損失側の非対称罰則（下回った分だけ罰する）にすると、道路を敷かなければ床を満たせない場所では
+    # 罰則を払うだけで済んでしまい「保証」にならない。無条件の下駄にすることで確実に保証する。
 
 
 def _always_raise() -> RoadCollectionArgs:
@@ -544,16 +545,20 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
         self, size: int, lim: tuple[float, float] = (-1.5, 1.5), center_pixel: bool = True
     ) -> torch.Tensor:
         """
-        人口密度予測値を合成する（道路のみから決まる値。最低ラインは損失側で罰則として課す）。
+        人口密度予測値を合成する。
         sigma_e     = sigma0 + k_sigma * w_e^reach_exponent   # 幅が太いほど到達半径(reach)が広い
         amplitude_e = min(amp_scale / sigma_e, 1)             # 到達半径が広いほどピーク強度は下がる
         c_e(x)      = amplitude_e * exp(-(relu(sdf_e(x)) / sigma_e)^2)
-        density(x)  = max_e c_e(x)                             # 重ね合わせではなく最大値を採用
+        raw(x)      = max_e c_e(x)                             # 重ね合わせではなく最大値を採用
+        density(x)  = max(raw(x), min_density_floor)           # 最低ラインを無条件で保証する
 
         「最大値」にしているのは、近くに幹線道路と街路があるとき、距離が近いというだけで幹線道路を
         優先させず、実際の寄与(c_e)が大きい方（＝街路の方が寄与が強ければ街路）を採用するため。
         幹線道路(幅広->sigma大->amplitude小)は「薄く広く」、街路(幅狭->sigma小->amplitude大)は
         「狭く大きく」効くようになる。
+
+        最低ラインは道路の有無によらず無条件で保証する(道路が無い場所では損失側の罰則を払うだけで
+        済んでしまい「保証」にならないため)。
 
         returns: (n_networks, size, size)
         """
@@ -578,7 +583,8 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
         n_networks = len(self.ids)
         result = torch.zeros((n_networks, size, size), dtype=c.dtype, device=c.device)
         index = self.edge_index_of.view(-1, 1, 1).expand(-1, size, size)
-        return torch.scatter_reduce(result, 0, index, c, reduce="amax")
+        raw = torch.scatter_reduce(result, 0, index, c, reduce="amax")
+        return raw.clamp(min=self.args.min_density_floor)
 
     def get_construction_costs(self, width_exponent: float = 1.0) -> torch.Tensor:
         """
