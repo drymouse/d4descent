@@ -18,6 +18,7 @@ def main():
     b.add("---task", "configs/tasks/roads.yaml")
     b.add("--task.cost_weight", 1e-3)
     b.add("--task.cost_width_exponent", 2.5)  # 幹線道路(幅広)への罰則を幅に対して超線形に強くする
+    b.add("--task.mesh_weight", 0.05)  # ループ形成(meshedness)への報酬。都市らしい街区構造を促す
     b.add("--task.min_density_floor", 0.2)  # 人口密度の最低ライン
     b.add("--task.underflow_weight", 5.0)  # 最低ラインを下回った分への追加罰則
     b.add("--task.road_collection_args.sigma0", 0.03)

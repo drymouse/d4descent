@@ -163,6 +163,25 @@ cost = sum_e length_e * width_e ^ cost_width_exponent * cost_weight
 
 道路の長さ×幅（≒舗装面積）をコストとみなす。`cost_width_exponent > 1` にすると、幅が広い道路（幹線道路）への罰則が幅に対して超線形に強くなる（デフォルト `2.5`。単純な線形だと `width_classes` の比率分しか差がつかず、幹線道路が乱立しやすかったため導入）。`Tri` の `node_weight`/`size_weight` に相当する役割を `cost_weight`（と `cost_width_exponent`）が担う。`compute_simplicity` で各ネットワークについて集計する。
 
+## 4.1 都市らしさの評価軸：ループ形成（meshedness）への報酬
+
+密度一致とコストだけでは道路網の位相（トポロジー）に選好がなく、密度勾配を追って根本から放射状に伸びる木構造（クモの巣状）になりやすい。Parish & Müllerの論文にも "ほとんどの道路は他の道路と交差するかループになって終わる。行き止まりは例外" とあり、Petraschの実装でも道路網から街区ポリゴンを抽出する前提としてサイクル検出を行っている——つまり**都市であるためには閉じたループ(街区)の存在が本質的**。
+
+これをグラフ理論の meshedness（alpha index）としてスコア化し、`compute_simplicity` に負のコスト（報酬）として加える:
+
+```
+V = 道路網を構成する生きたノード数(次数>0。孤立ノードは除く)
+E = エッジ数
+cycles     = max(E - V + 1, 0)     # 閉路数。連結成分が1つの場合は厳密値、複数ある場合は下限値（近似）
+meshedness = cycles / max(2V - 5, 1)  # 平面グラフが取りうる最大閉路数に対する比。木構造で0
+
+simplicity = cost * cost_weight - meshedness * mesh_weight
+```
+
+`RoadNetworkCollection.get_meshedness()` として実装（`E`, `V` の集計のみで済み、面(街区)の実検出は不要なので安価）。`cycles` の計算は連結成分数を1と仮定した近似（`AddFree`で複数の孤立した部分網ができている場合は真値よりわずかに小さく見積もられるが、`add_free_weight`は低いデフォルトなので実用上は問題にならない想定）。
+
+数値確認済み: V=4のノード集合で木構造(E=3)は`simplicity`寄与≈+4.6e-7（ほぼ0）だが、そこに1本足してループを作る(E=4)と`simplicity`寄与≈-0.0167（エッジが1本増えてコストは上がっているのに、meshedness報酬がそれを大きく上回り正味で有利になる）。
+
 ## 5. `TaskArgs`（想定フィールド）
 
 | パラメータ | 意味 | 備考 |
@@ -176,6 +195,7 @@ cost = sum_e length_e * width_e ^ cost_width_exponent * cost_weight
 | `underflow_weight` | 最低ラインを下回った分への追加罰則の重み | 大きいほど床割れを強く嫌う |
 | `cost_weight` | 建設コスト正則化の重み | `Tri.node_weight` に相当 |
 | `cost_width_exponent` | 建設コストの幅に対する指数 | 1より大きいほど幹線道路への罰則が強くなる |
+| `mesh_weight` | ループ形成(meshedness)への報酬の重み | 4.1節。大きいほどSnapによるループ化を優先する |
 | `snap_radius` | スナップ候補とみなす最大距離（グリッドのセルサイズにも使う） | |
 | `default_length` / `length_range` | Add系書き換えの新規エッジ長 | |
 | `add_weight` / `add_free_weight` | `AddFromNode`/`AddFree` の候補数に比例した重み | `n_candidates * weight` 個の候補を生成する。値を下げると相対的にその書き換えが選ばれにくくなる |

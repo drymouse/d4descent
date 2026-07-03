@@ -595,6 +595,36 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
     def get_sizes(self) -> list[int]:
         return [e - s for s, e in self.edge_ranges]
 
+    def get_meshedness(self) -> torch.Tensor:
+        """
+        道路網のループ(閉路)の多さを 0〜1 程度で表す指標（meshedness / alpha index）。
+        cycles = max(E - V + 1, 0)          # 閉路数（連結成分が1つの場合は厳密。複数ある場合は下限値）
+        meshedness = cycles / max(2V - 5, 1)  # 平面グラフが取りうる最大閉路数に対する比
+
+        V は孤立ノード(次数0。Remove直後などでまだ prune されていないもの)を除いた実際に
+        道路網を構成するノード数で数える。木構造(閉路なし)では0、Snapでループを作るほど増える。
+        """
+        device = self.device()
+        n_total_nodes = len(self.nodes)
+        n_networks = len(self.ids)
+
+        degree = torch.zeros(n_total_nodes, dtype=torch.long, device=device)
+        degree.scatter_add_(0, self.edges.flatten(), torch.ones(2 * len(self.edges), dtype=torch.long, device=device))
+        live = (degree > 0).float()
+
+        node_index_of = torch.empty(n_total_nodes, dtype=torch.long, device=device)
+        for i, (s, e) in enumerate(self.node_ranges):
+            node_index_of[s:e] = i
+
+        v = torch.scatter_reduce(
+            torch.zeros(n_networks, device=device), 0, node_index_of, live, reduce="sum"
+        )  # (n_networks,)
+        e = torch.tensor(self.get_sizes(), dtype=torch.float32, device=device)  # (n_networks,)
+
+        cycles = (e - v + 1).clamp(min=0.0)
+        denom = (2 * v - 5).clamp(min=1.0)
+        return cycles / denom
+
     @classmethod
     def patch_args(cls, args: RoadCollectionArgs) -> Type["RoadNetworkCollection"]:
         return type(

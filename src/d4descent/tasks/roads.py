@@ -28,6 +28,7 @@ from ..losses.raster import RasterLossArgs
 class RoadArgs(TaskArgs):
     cost_weight: float = 1e-3  # 建設コスト(長さ×幅^cost_width_exponent)の正則化重み。Triのnode_weightに相当
     cost_width_exponent: float = 2.0  # 幅への指数。1より大きいほど幹線道路(幅広)への罰則が超線形に強くなる
+    mesh_weight: float = 0.05  # ループ形成(meshedness)への報酬の重み。大きいほどSnapでのループ化を優先する
     min_density_floor: float = 0.15  # 人口密度の最低ライン
     underflow_weight: float = 4.0  # 最低ラインを下回った分への追加罰則の重み（下回るほど二乗で効く）
     better_abs_eps: float = 1e-8
@@ -73,7 +74,11 @@ class RoadTask(Task[RoadNetwork, RoadRewrite, StateT]):
     def compute_simplicity(self, collection: ObjectCollection[RoadNetwork]) -> list[float]:
         assert isinstance(collection, RoadNetworkCollection)
         costs = collection.get_construction_costs(width_exponent=self.args.cost_width_exponent)
-        return [c * self.args.cost_weight for c in costs.tolist()]
+        meshedness = collection.get_meshedness()
+        return [
+            c * self.args.cost_weight - m * self.args.mesh_weight
+            for c, m in zip(costs.tolist(), meshedness.tolist())
+        ]
 
     def make_proposals(self, obj: RoadNetwork) -> tuple[ObjectCollection[RoadNetwork], list[RoadRewrite]]:
         raise NotImplementedError("use make_proposals_ex")
