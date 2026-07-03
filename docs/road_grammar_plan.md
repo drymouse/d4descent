@@ -1,0 +1,197 @@
+# 道路網文法（Road Grammar）実装計画
+
+## 背景・参考文献
+
+- Parish & Müller, *Procedural Modeling of Cities* (CityEngine, SIGGRAPH 2001)
+  - 拡張L-system: `ideal successor` → `globalGoals`（大域目標がパラメータを決定）→ `localConstraints`（局所制約で調整・FAILED判定）
+  - 道路は highway（人口密度ピークを結ぶ）と street（highway 間を人口密度に沿って埋める）の2種
+  - self-sensitive L-system: 道路端が既存道路に交差/接近 → 交差点生成・延長（＝本文法の「スナップ」に相当）
+- Petrasch, *Prozedurale Städtegenerierung mit Hilfe von L-Systemen* (TU Dresden, 2008)
+  - 上記手法のドイツ語での再実装レポート。道路網→街区→敷地→建物の一連の実装詳細を持つ（本文法では道路網のみが対象）
+
+d4descent 側では、これらの論文の「道路網がヒューリスティックに人口密度から生成される」プロセスを逆転し、**道路網（最適化対象）→ 人口密度の予測値を合成するforward model** を定義し、target の人口密度マップとの差を勾配降下＋離散書き換えで最小化する。
+
+## 1. プリミティブ設計：グラフ表現
+
+既存文法との違い:
+
+| 文法 | トポロジー | 頂点共有の扱い |
+|---|---|---|
+| `Tree` | 木構造。ノード位置は親からの相対極座標（長さ+角度）で計算 | 親子関係は配列インデックスで暗黙的 |
+| `Shape`（arclines） | 開放/閉ループ | プリミティブの `start`/`end` を **Tensorオブジェクトの同一性** で共有、`MergeClose` で貼り替え可能 |
+| **Road（本計画）** | **一般グラフ（ループ可）** | ノード座標をテーブルとして持ち、エッジはノードindexのペアで参照 |
+
+道路網はループ（交差点による環状構造）を持ちうるため `Tree` の木構造は採用しない。ノード座標配列 + エッジ（ノードindexペア + 幅）という明示的グラフ表現を採用する。
+
+### 道路幅は離散固定値（最適化対象外）
+
+道路幅 `width` は勾配最適化の対象にせず、あらかじめ決めた離散クラス（例: `STREET = 0.02`, `HIGHWAY = 0.05`）から選ぶ固定値とする。
+
+- `RoadNetwork.widths` は `torch.Tensor`（勾配計算用の中間値としては使うが `requires_grad=False`）または単純な `tuple[float, ...]` として保持し、`parameters()` / `per_object_grads()` には含めない
+- どの幅クラスを使うかは書き換え（`AddFree` / `AddFromNode`）の側で決定する。具体的には、新規道路を追加する候補ごとに **幅クラスの数だけ提案を複製**し（例: street版・highway版を両方提案）、損失が良い方を `combine_proposals` が選ぶ。これは `ArcLines` の `ToLine`/`ToArc` のように「離散的な選択肢を提案として列挙し、連続最適化ではなく書き換え選択に委ねる」既存パターンと同じ考え方
+- 幅を変更する専用の書き換え（例: street→highway への格上げ）は今回のマイルストーンには含めない（必要になれば later で追加）
+
+### データクラス（案）
+
+```python
+@dataclass
+class RoadPayload:
+    pass
+
+@dataclass
+class RoadNetwork:
+    nodes: torch.Tensor              # (n_nodes, 2) ノード座標。勾配対象
+    widths: torch.Tensor             # (n_edges,) 道路幅。離散固定値、勾配対象外
+    edges: tuple[tuple[int, int], ...]  # (n_edges,) (start_node_idx, end_node_idx) 静的トポロジー
+    id: int = field(default_factory=lambda: Context.get().gen_id())
+    payload: RoadPayload = field(default_factory=RoadPayload)
+
+@dataclass
+class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
+    nodes: torch.Tensor              # (total_nodes, 2) 全ネットワーク分を結合。勾配対象
+    widths: torch.Tensor             # (total_edges,) 勾配対象外
+    edges: tuple[tuple[int, int], ...]   # 結合後のグローバルnode index
+    edge_index_of: torch.Tensor      # (total_edges,) 各エッジがどのネットワーク(=object)に属するか
+    node_indices: tuple[tuple[int, int], ...]  # 各ネットワークのノード範囲 (start, end)
+    edge_indices: tuple[tuple[int, int], ...]  # 各ネットワークのエッジ範囲 (start, end)
+    ids: tuple[int, ...]
+    payloads: tuple[RoadPayload, ...]
+```
+
+`ObjectCollection` の1オブジェクト＝1つの道路網（=1つの都市の候補案）。離散書き換えの提案評価では、複数の道路網候補（例:「あるエッジを1本追加した版」を複数）を1つの `RoadNetworkCollection` にまとめてバッチ評価する（`Tri`/`Tree` と同じ運用）。
+
+### SDF（`rasterize`）
+
+各エッジをカプセル形状として距離計算し、`Tri`/`Shape` と同様に `scatter_reduce(..., reduce="amin")` でネットワーク単位に集約する。
+
+```python
+def rasterize(self, positions):
+    # 1. 線分までの距離 - 幅/2 を全エッジについて計算 -> (total_edges, ...)
+    # 2. scatter_reduce(amin) で edge_index_of によりネットワーク単位に集約 -> (n_networks, ...)
+    ...
+```
+
+## 2. 書き換え操作
+
+| 操作 | 内容 | 対応する既存文法の実装 |
+|---|---|---|
+| `AddFree` | 新規ノード2個 + エッジ1本を空間中に追加（起点となる孤立道路） | `Tree.AddAnywhere` に類似 |
+| `AddFromNode(node_id)` | 既存ノードから新規ノード+エッジを伸ばす。分岐は既存ノードの次数が増えるだけなので専用操作は不要 | `Tree.AddBranch` |
+| `RemoveEdge(edge_id)` | 末端（次数1）のエッジを削除し、孤立したノードも掃除 | `Tree.RemoveBranch` |
+| `Snap(edge_id, target_node_id)` | エッジの一端（次数1の"ぶら下がった"端点）を、近傍の既存ノードに張り替えてループ/交差点を形成 | `Shape.MergeClose`（端点の張り替え） |
+
+- `AddFree` / `AddFromNode` は幅クラスの数だけ提案を複製する（上記「道路幅は離散固定値」参照）
+- `make_proposals` は `Tri`/`Tree` の `make_proposals_ex` に倣い、`torch.cat` をO(1)回に抑えたバッチ実装にする（`docs/perf_improvements.md` 参照）
+
+### 2.1 Snap候補探索アルゴリズム
+
+Snap は「次数1の“ぶら下がった”端点」ごとに、半径 `snap_radius` 以内にある既存ノードを探す処理。単純な全ペア総当たりは O(n²) になるため、以下のいずれかで高速化する。
+
+**推奨: 一様グリッドによる空間ハッシュ（追加の依存ライブラリ不要）**
+
+1. セルサイズを `snap_radius` に設定し、全ノードの座標を `cell = floor((pos - origin) / snap_radius)` で整数バケットに変換
+2. バケットをキーにした辞書 `dict[(int,int), list[node_idx]]` を構築（O(n)）
+3. 各ダングリング端点について、自分のバケットと周囲8近傍（計3×3セル）に属するノードだけを距離チェック（`snap_radius` 以内なら候補）
+4. ノードが空間的に偏って密集しない限り平均 O(n) で完了する
+
+これは `Shape.resolve_intersections` が行っているバウンディングボックスでの絞り込みと同じ発想で、既存コードのスタイルに合う。
+
+**代替案: KD-tree（`scipy.spatial.cKDTree`）**
+
+`cKDTree(all_node_positions).query_ball_point(dangling_positions, r=snap_radius)` で同様の近傍探索が O(n log n) で行える。ノード分布が極端に偏る場合や実装をより頑健にしたい場合の代替。ただし `scipy` は現状 `pyproject.toml` の依存に含まれていないため、追加が必要になる点に注意（一様グリッド法で十分なら不要）。
+
+まずは一様グリッド法で実装し、大規模ネットワークで問題が出た場合にKD-treeへ切り替える方針とする。
+
+## 3. 目的関数：人口密度の合成（カスタム `_compute_losses`）
+
+`RasterLossMixin`（二値占有率のMSE）はそのまま使わず、道路網から人口密度場を合成するforward modelを自作する。ただし **target の入力形式は raster タスク（`_pngs`）と同じ `[0,1]` の画像（`target_img`）をそのまま人口密度マップとして扱う**（専用の正規化パイプラインは用意しない）。
+
+### 3.1 エッジごとの被覆度
+
+```
+d_e(x)  = relu(sdf_e(x))              # 道路外側の距離（内側は0）
+sigma_e = sigma0 + k_sigma * w_e      # 幅が太い道ほど到達範囲が広い
+c_e(x)  = exp(-(d_e(x) / sigma_e)^2)  # 道路上で1、離れると0に近づく。値域 (0, 1]
+```
+
+### 3.2 複数エッジの飽和つき合成
+
+```
+raw(x) = 1 - exp(sum_e log1p(-c_e(x).clamp(max=1 - 1e-6)))   # 1 - Π(1 - c_e(x)) を数値安定に計算
+```
+
+### 3.3 ベースライン密度
+
+道路から離れた領域も密度0を目標にせず、一定のベースライン密度を持たせる。
+
+```
+density_pred(x) = baseline + (1 - baseline) * raw(x)
+```
+
+- `baseline` は `TaskArgs` の固定値として**入力で直接与える**（自動算出はしない）
+- 学習可能パラメータにはしない: 離散書き換えの提案比較（`combine_proposals`）はどの提案でも同じ `baseline` を使うため比較には影響しないが、勾配最適化のたびに動くと道路網のパラメータと絡み合い挙動が読みにくくなる
+
+### 3.4 損失
+
+```python
+def _compute_losses(self, collection, state):
+    density_pred = collection.compute_density(grid_positions, sigma0, k_sigma, baseline)  # (n_networks, size, size)
+    loss = torch.mean((density_pred - self.target_img).square().flatten(-2), dim=-1)  # (n_networks,)
+    return loss, {}
+```
+
+`compute_density` は `rasterize`（`amin`集約、可視化・境界判定用）とは別のメソッドとして `RoadNetworkCollection` に実装する（集約方法が `amin` ではなく「和→飽和」のため）。ただしエッジごとのカプセルSDF計算自体は両者で共通化できる。`self.target_img` は既存の raster タスクと同じ仕組み（`RasterLossArgs`/`target_img` 経由）でロードした `[0,1]` 画像をそのまま使う。
+
+## 4. 正則化（複雑さ＝建設コスト）
+
+```
+cost = sum_e length_e * width_e * cost_weight
+```
+
+道路の長さ×幅（≒舗装面積）をコストとみなす。`Tri` の `node_weight`/`size_weight` に相当する役割を `cost_weight` が担う。`compute_simplicity` で各ネットワークについて集計する。
+
+## 5. `TaskArgs`（想定フィールド）
+
+| パラメータ | 意味 | 備考 |
+|---|---|---|
+| `width_classes` | 選択可能な道路幅の離散値一覧 | 例: `(0.02, 0.05)`。Add系書き換えで各値を提案 |
+| `sigma0` | 最小到達半径（street相当） | 密度合成カーネルの基準スケール |
+| `k_sigma` | 幅→到達範囲の係数 | highway ほど広域に効くようにする |
+| `baseline_density` | 道路から離れた領域の最低密度 | 入力で直接指定する固定値 |
+| `cost_weight` | 建設コスト正則化の重み | `Tri.node_weight` に相当 |
+| `snap_radius` | スナップ候補とみなす最大距離（グリッドのセルサイズにも使う） | |
+| `default_length` / `length_range` | Add系書き換えの新規エッジ長 | |
+
+## 6. 可視化
+
+`Tri`/`UR` の `visualize` 実装（`tasks/tri.py`）と同じ3層構成に倣う。1枚の `MPLVisualizerAxes` 上に:
+
+1. **背景**: `self.target_img`（target 人口密度）を `imshow(..., cmap="plasma", alpha=0.2)` で薄く表示
+2. **重ね書き**: `collection.compute_density(...)` で計算した予測密度を `imshow(..., cmap="magma", alpha=0.5〜0.6)` で表示（roadsから合成された密度そのものが主役なのでtargetより濃いめにする）
+3. **前景**: 道路網を線分として描画。`ax.ax.plot([x1, x2], [y1, y2], color="white", linewidth=width_to_pt(w))` のように、幅クラスごとに線の太さを変えてノード・エッジを描く（`Tree.visualize` の `Line2D` 描画パターンを流用）
+
+```python
+def visualize(self, collection: ObjectCollection[RoadNetwork], step: int, loss: float, state: None) -> np.ndarray:
+    assert isinstance(collection, RoadNetworkCollection)
+    net = collection[0]
+    fig = MPLVisualizer(1, 1, 10.8, 10.8, xlim=self.render_args.lim, ylim=self.render_args.lim, notebook=False)
+    ax = fig[0]
+    extent = (self.render_args.lim[0], self.render_args.lim[1], self.render_args.lim[1], self.render_args.lim[0])
+    ax.ax.imshow(self.target_img.detach().cpu().numpy(), extent=extent, cmap="plasma", vmin=0, vmax=1, alpha=0.2)
+    density = collection.compute_density(grid_positions, ...)[0]  # (size, size)
+    ax.ax.imshow(density.detach().cpu().numpy(), extent=extent, cmap="magma", vmin=0, vmax=1, alpha=0.5)
+    for (i, j), w in zip(net.edges, net.widths.tolist()):
+        (x1, y1), (x2, y2) = net.nodes[i].tolist(), net.nodes[j].tolist()
+        ax.ax.plot([x1, x2], [y1, y2], color="white", linewidth=width_to_pt(w), solid_capstyle="round")
+    ax.ax.set_title(f"{self.get_elapsed_time():.0f}s: {net.id}: {loss:.2e}: E{len(net.edges)}")
+    return fig.get_image()
+```
+
+## 7. 実装マイルストーン
+
+1. `RoadNetwork` / `RoadNetworkCollection`：SDF (`rasterize`) と `visualize`（密度なしでまず道路のみ）を実装し、手動で作ったネットワークが正しく描画されるか確認
+2. 書き換え：`AddFromNode` / `RemoveEdge` のみ（ループなし木構造、幅クラスは固定1種類）で `make_proposals` / `combine_proposals` の動作確認
+3. カスタム損失（`compute_density` + baseline + MSE）と `visualize` への密度描画追加を実装し、簡単な合成 target マップに対して収束するか確認
+4. `Snap` 書き換え（一様グリッド探索）を追加してループ形成を確認
+5. 幅クラスを複数に増やし、Add提案の複製ロジックを確認
+6. `cost_weight` 等のハイパーパラメータ調整、実データ（人口密度マップ）でのテスト
