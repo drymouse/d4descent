@@ -11,18 +11,24 @@ def main():
     b = CLIBuilder("Road-F")
     b.add("--save_path", "output/###JOB_NAME###")
     b.add("--render.blur", 1 / math.sqrt(2))
-    b.add("--img_mode", "wob")  # 白=高密度、黒=低密度のマップを想定（反転しない）
+    b.add("--img_mode", "bow")  # 画像の黒(ロゴ/市街地)=高密度になるよう反転する
     # loss (target_img のロード経路のみ流用。損失自体は RoadDensityTask のカスタム実装)
     b.add("---loss", "configs/losses/raster.yaml")
     # task
     b.add("---task", "configs/tasks/roads.yaml")
     b.add("--task.cost_weight", 1e-3)
+    b.add("--task.cost_width_exponent", 2.5)  # 幹線道路(幅広)への罰則を幅に対して超線形に強くする
+    b.add("--task.min_density_floor", 0.2)  # 人口密度の最低ライン
+    b.add("--task.underflow_weight", 5.0)  # 最低ラインを下回った分への追加罰則
     b.add("--task.road_collection_args.sigma0", 0.03)
-    b.add("--task.road_collection_args.k_sigma", 1.0)
-    b.add("--task.road_collection_args.baseline_density", 0.05)
+    b.add("--task.road_collection_args.k_sigma", 300.0)
+    b.add("--task.road_collection_args.reach_exponent", 2.5)  # 幹線道路の到達半径を不釣り合いに拡大
+    b.add("--task.road_collection_args.amp_scale", 0.045)  # 幹線道路=薄く広く、街路=狭く大きく
     b.add("--task.rewrite_args.width_classes", [0.02, 0.05])
     b.add("--task.rewrite_args.length_range", [0.05, 0.15])
     b.add("--task.rewrite_args.snap_radius", 0.05)
+    b.add("--task.rewrite_args.add_weight", 3.0)  # 先端から伸ばす確率を上げる
+    b.add("--task.rewrite_args.add_free_weight", 0.15)  # 任意の場所への追加確率を下げる
     # optim
     b.add("--optim.proposal_trigger", "step")
     b.add("--optim.propose_every", 25)

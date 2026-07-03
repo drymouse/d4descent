@@ -26,7 +26,10 @@ from ..losses.raster import RasterLossArgs
 
 @dataclass
 class RoadArgs(TaskArgs):
-    cost_weight: float = 1e-3  # 建設コスト(長さ×幅)の正則化重み。Triのnode_weightに相当
+    cost_weight: float = 1e-3  # 建設コスト(長さ×幅^cost_width_exponent)の正則化重み。Triのnode_weightに相当
+    cost_width_exponent: float = 2.0  # 幅への指数。1より大きいほど幹線道路(幅広)への罰則が超線形に強くなる
+    min_density_floor: float = 0.15  # 人口密度の最低ライン
+    underflow_weight: float = 4.0  # 最低ラインを下回った分への追加罰則の重み（下回るほど二乗で効く）
     better_abs_eps: float = 1e-8
     rewrite_args: RoadRewriteArgs = field(default_factory=RoadRewriteArgs)
     road_collection_args: RoadCollectionArgs = field(default_factory=RoadCollectionArgs)
@@ -69,7 +72,7 @@ class RoadTask(Task[RoadNetwork, RoadRewrite, StateT]):
 
     def compute_simplicity(self, collection: ObjectCollection[RoadNetwork]) -> list[float]:
         assert isinstance(collection, RoadNetworkCollection)
-        costs = collection.get_construction_costs()
+        costs = collection.get_construction_costs(width_exponent=self.args.cost_width_exponent)
         return [c * self.args.cost_weight for c in costs.tolist()]
 
     def make_proposals(self, obj: RoadNetwork) -> tuple[ObjectCollection[RoadNetwork], list[RoadRewrite]]:
@@ -266,7 +269,10 @@ class RoadDensityTask(RoadTask[None]):
         density = collection.compute_density(
             self.render_args.size, self.render_args.lim, center_pixel=self.render_args.center_pixel
         )  # (n_networks, size, size)
-        loss = torch.mean((density - self.target_img).square().flatten(-2), dim=-1)
+        mse = (density - self.target_img).square()
+        # 最低ラインを下回った分だけ二乗で追加罰則（target側の値に関わらず、床を下回ること自体を罰する）
+        underflow = (self.args.min_density_floor - density).clamp(min=0.0).square()
+        loss = (mse + self.args.underflow_weight * underflow).flatten(-2).mean(dim=-1)
         return loss, {}
 
     def visualize(self, collection: ObjectCollection[RoadNetwork], step: int, loss: float, state: None) -> np.ndarray:

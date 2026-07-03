@@ -153,9 +153,15 @@ class RoadNetwork:
         self,
         ax: MPLVisualizerAxes,
         color: str = "white",
-        min_lw: float = 1.0,
-        max_lw: float = 6.0,
+        casing_color: str = "black",
+        min_lw: float = 1.8,
+        max_lw: float = 7.0,
+        casing_extra: float = 1.6,
     ) -> None:
+        """
+        背景のヒートマップに埋もれないよう、白の道路本体の下に一回り太い黒のケーシングを描く
+        （地図でよく使われる技法）。細い道（street）でも min_lw を確保して視認できるようにする。
+        """
         widths = self.widths.tolist()
         if not widths:
             return
@@ -165,6 +171,7 @@ class RoadNetwork:
         for (i, j), w in zip(self.edges.tolist(), widths):
             (x0, y0), (x1, y1) = nodes[i], nodes[j]
             lw = min_lw + (max_lw - min_lw) * (w - min_w) / span
+            ax.ax.plot([x0, x1], [y0, y1], color=casing_color, linewidth=lw + casing_extra, solid_capstyle="round", zorder=4)
             ax.ax.plot([x0, x1], [y0, y1], color=color, linewidth=lw, solid_capstyle="round", zorder=5)
 
     def prune_orphan_nodes(self) -> "RoadNetwork":
@@ -194,7 +201,7 @@ class RoadNetwork:
         specs: list[RoadRewrite] = []
 
         if args.add_weight > 0 and live_nodes:
-            n_cand = max(args.n_add_candidates, 1)
+            n_cand = max(round(args.n_add_candidates * args.add_weight), 1)
             pos = self.nodes.detach().cpu()
             for _ in range(n_cand):
                 ni = random.choice(live_nodes)
@@ -207,7 +214,7 @@ class RoadNetwork:
                     specs.append(RoadRewriteAdd(from_node=ni, x=x1, y=y1, width=w))
 
         if args.add_free_weight > 0:
-            n_cand = max(args.n_free_candidates, 1)
+            n_cand = max(round(args.n_free_candidates * args.add_free_weight), 1)
             lim0, lim1 = lim
             for _ in range(n_cand):
                 x0 = random.uniform(lim0, lim1)
@@ -349,8 +356,14 @@ class RoadNetwork:
 @dataclass
 class RoadCollectionArgs:
     sigma0: float = 0.03  # street相当の最小到達半径
-    k_sigma: float = 1.0  # 幅 -> 到達半径の係数
-    baseline_density: float = 0.05  # 道路から離れた領域の最低密度
+    k_sigma: float = 1.0  # 幅 -> 到達半径の係数（幅が太いほど広く効く）
+    reach_exponent: float = 1.0  # sigma_e = sigma0 + k_sigma * w_e^reach_exponent。1より大きいほど
+    # 幅の広い道路(幹線道路)の到達半径だけが不釣り合いに拡大し、幅の狭い道路(街路)はsigma0付近に留まる。
+    amp_scale: float = 0.05  # ピーク強度 = amp_scale / sigma_e (<=1)。sigma(=到達半径)が広いほどピークが下がる
+    # amp_scale と sigma_e から決まるピーク強度により、幹線道路(幅広->sigma大)は「薄く広く」、
+    # 街路(幅狭->sigma小)は「狭く大きく」効くようにする(断面積 amplitude*sigma がほぼ一定になる)。
+    # 「最低密度」は forward model に無条件で焼き込まない（下回っても損失が発生しなくなるため）。
+    # 代わりに RoadArgs.min_density_floor / underflow_weight で損失側の罰則として与える。
 
 
 def _always_raise() -> RoadCollectionArgs:
@@ -531,10 +544,16 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
         self, size: int, lim: tuple[float, float] = (-1.5, 1.5), center_pixel: bool = True
     ) -> torch.Tensor:
         """
-        人口密度予測値を合成する。
-        c_e(x)  = exp(-(relu(sdf_e(x)) / sigma_e)^2)
-        raw(x)  = 1 - Π_e (1 - c_e(x))   (log1pで数値安定に計算)
-        density = baseline + (1 - baseline) * raw(x)
+        人口密度予測値を合成する（道路のみから決まる値。最低ラインは損失側で罰則として課す）。
+        sigma_e     = sigma0 + k_sigma * w_e^reach_exponent   # 幅が太いほど到達半径(reach)が広い
+        amplitude_e = min(amp_scale / sigma_e, 1)             # 到達半径が広いほどピーク強度は下がる
+        c_e(x)      = amplitude_e * exp(-(relu(sdf_e(x)) / sigma_e)^2)
+        density(x)  = max_e c_e(x)                             # 重ね合わせではなく最大値を採用
+
+        「最大値」にしているのは、近くに幹線道路と街路があるとき、距離が近いというだけで幹線道路を
+        優先させず、実際の寄与(c_e)が大きい方（＝街路の方が寄与が強ければ街路）を採用するため。
+        幹線道路(幅広->sigma大->amplitude小)は「薄く広く」、街路(幅狭->sigma小->amplitude大)は
+        「狭く大きく」効くようになる。
 
         returns: (n_networks, size, size)
         """
@@ -552,23 +571,23 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
         p1 = self.nodes[self.edges[:, 1]]
         sdf = _capsule_sdf(grid, p0, p1, self.widths)  # (total_edges, size, size)
         d = sdf.clamp(min=0.0)
-        sigma = (self.args.sigma0 + self.args.k_sigma * self.widths).clamp(min=1e-6)  # (total_edges,)
-        c = torch.exp(-(d / sigma.view(-1, 1, 1)).square())
-        log1mc = torch.log1p(-c.clamp(max=1 - 1e-6))  # (total_edges, size, size)
+        sigma = (self.args.sigma0 + self.args.k_sigma * self.widths.pow(self.args.reach_exponent)).clamp(min=1e-6)
+        amplitude = (self.args.amp_scale / sigma).clamp(max=1.0)  # (total_edges,)
+        c = amplitude.view(-1, 1, 1) * torch.exp(-(d / sigma.view(-1, 1, 1)).square())  # (total_edges, size, size)
 
         n_networks = len(self.ids)
-        result = torch.zeros((n_networks, size, size), dtype=log1mc.dtype, device=log1mc.device)
+        result = torch.zeros((n_networks, size, size), dtype=c.dtype, device=c.device)
         index = self.edge_index_of.view(-1, 1, 1).expand(-1, size, size)
-        sum_log1mc = torch.scatter_reduce(result, 0, index, log1mc, reduce="sum")
-        raw = 1 - torch.exp(sum_log1mc)
-        baseline = self.args.baseline_density
-        return baseline + (1 - baseline) * raw
+        return torch.scatter_reduce(result, 0, index, c, reduce="amax")
 
-    def get_construction_costs(self) -> torch.Tensor:
-        """長さ×幅 の総和（建設コスト相当）をネットワークごとに集計する。"""
+    def get_construction_costs(self, width_exponent: float = 1.0) -> torch.Tensor:
+        """
+        長さ×幅^width_exponent の総和（建設コスト相当）をネットワークごとに集計する。
+        width_exponent > 1 にすると、幅の広い道路(幹線道路)への罰則が幅に対して超線形に強くなる。
+        """
         p0 = self.nodes[self.edges[:, 0]]
         p1 = self.nodes[self.edges[:, 1]]
-        cost = (p1 - p0).norm(dim=-1) * self.widths  # (total_edges,)
+        cost = (p1 - p0).norm(dim=-1) * self.widths.pow(width_exponent)  # (total_edges,)
         n_networks = len(self.ids)
         result = torch.zeros(n_networks, device=cost.device, dtype=cost.dtype)
         return torch.scatter_reduce(result, 0, self.edge_index_of, cost, reduce="sum")

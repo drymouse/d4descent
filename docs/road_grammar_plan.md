@@ -109,46 +109,59 @@ Snap は「次数1の“ぶら下がった”端点」ごとに、半径 `snap_r
 ### 3.1 エッジごとの被覆度
 
 ```
-d_e(x)  = relu(sdf_e(x))              # 道路外側の距離（内側は0）
-sigma_e = sigma0 + k_sigma * w_e      # 幅が太い道ほど到達範囲が広い
-c_e(x)  = exp(-(d_e(x) / sigma_e)^2)  # 道路上で1、離れると0に近づく。値域 (0, 1]
+d_e(x)      = relu(sdf_e(x))                        # 道路外側の距離（内側は0）
+sigma_e     = sigma0 + k_sigma * w_e^reach_exponent # 幅が太い道ほど到達範囲(reach)が広い
+amplitude_e = min(amp_scale / sigma_e, 1)           # reachが広いほどピーク強度は下がる
+c_e(x)      = amplitude_e * exp(-(d_e(x) / sigma_e)^2)  # 値域 (0, amplitude_e]
 ```
 
-### 3.2 複数エッジの飽和つき合成
+`amplitude_e = amp_scale / sigma_e` は「断面積(amplitude×sigma)がほぼ一定」になるような正規化で、幹線道路（幅広→sigma大→amplitude小）は「薄く広く」、街路（幅狭→sigma小→amplitude大）は「狭く大きく」効くようにする、というユーザー要望をそのまま数式化したもの。`reach_exponent > 1` にすると `w_e` の指数が効くため、幅の広い道路(幹線道路)の到達半径だけが不釣り合いに拡大し、幅の狭い道路(街路)は`sigma0`付近に留まる（幹線道路をさらに広く薄くしたいという追加要望に対応）。
+
+### 3.2 複数エッジの合成：重ね合わせではなく最大値
+
+当初は複数エッジを確率的OR（`1 - Π(1-c_e(x))`）で重ね合わせていたが、これだと近くに幹線道路と街路が両方あるとき、必ず両方の寄与が加算されてしまい、「街路の寄与の方が強ければ街路を採用する」という選択的な挙動にならない。ユーザー要望により**各点で最も寄与の大きいエッジを採用する（最大値）**方式に変更した：
 
 ```
-raw(x) = 1 - exp(sum_e log1p(-c_e(x).clamp(max=1 - 1e-6)))   # 1 - Π(1 - c_e(x)) を数値安定に計算
+density(x) = max_e c_e(x)
 ```
 
-### 3.3 ベースライン密度
+`scatter_reduce(..., reduce="amax")` で実装する（`amin`ベースの`rasterize`と対称的な形）。この方式なら、ある点が幹線道路の直上（距離0）にあっても、少し離れた街路の`c_e`の方が大きければ、街路の値が採用される。実際に検証済み: 幹線道路の内側(dist=0, c_e≈0.23)にいても、0.05離れた街路(c_e≈0.31)の方が値が大きければ街路が採用されることを数値確認した。
 
-道路から離れた領域も密度0を目標にせず、一定のベースライン密度を持たせる。
+### 3.3 最低ライン（当初案から変更）
+
+当初は `density_pred = baseline + (1 - baseline) * raw(x)` として forward model に無条件で加算していたが、これだと `density_pred` が数式上 `baseline` を下回ることが絶対にできず、「最低ラインを下回った場合のペナルティ」を追加しようにも常にゼロになってしまう（実際に運用してみて気づいた設計ミス）。
+
+そこで **`compute_density` は `raw(x)` をそのまま返す**（無条件の下駄を廃止）。最低ラインは損失側の非対称な罰則として実装する:
 
 ```
-density_pred(x) = baseline + (1 - baseline) * raw(x)
+mse(x)       = (density(x) - target(x))^2
+underflow(x) = relu(min_density_floor - density(x))^2   # 床を下回った分だけ二乗で罰する。targetの値によらない
+loss(x)      = mse(x) + underflow_weight * underflow(x)
 ```
 
-- `baseline` は `TaskArgs` の固定値として**入力で直接与える**（自動算出はしない）
-- 学習可能パラメータにはしない: 離散書き換えの提案比較（`combine_proposals`）はどの提案でも同じ `baseline` を使うため比較には影響しないが、勾配最適化のたびに動くと道路網のパラメータと絡み合い挙動が読みにくくなる
+- `min_density_floor` / `underflow_weight` は `RoadArgs`（Task側）のフィールド。`RoadCollectionArgs` からは `baseline_density` を削除した
+- こうすることで「最低ラインを上げる」(`min_density_floor` を上げる)と「下回った時のペナルティを強める」(`underflow_weight` を上げる)を独立に制御できる
 
 ### 3.4 損失
 
 ```python
 def _compute_losses(self, collection, state):
-    density_pred = collection.compute_density(grid_positions, sigma0, k_sigma, baseline)  # (n_networks, size, size)
-    loss = torch.mean((density_pred - self.target_img).square().flatten(-2), dim=-1)  # (n_networks,)
+    density = collection.compute_density(size, lim, center_pixel)  # (n_networks, size, size)
+    mse = (density - self.target_img).square()
+    underflow = (self.args.min_density_floor - density).clamp(min=0.0).square()
+    loss = (mse + self.args.underflow_weight * underflow).flatten(-2).mean(dim=-1)
     return loss, {}
 ```
 
-`compute_density` は `rasterize`（`amin`集約、可視化・境界判定用）とは別のメソッドとして `RoadNetworkCollection` に実装する（集約方法が `amin` ではなく「和→飽和」のため）。ただしエッジごとのカプセルSDF計算自体は両者で共通化できる。`self.target_img` は既存の raster タスクと同じ仕組み（`RasterLossArgs`/`target_img` 経由）でロードした `[0,1]` 画像をそのまま使う。
+`compute_density` は `rasterize`（`amin`集約、可視化・境界判定用）とは別のメソッドとして `RoadNetworkCollection` に実装する（集約方法が `amin` ではなく「和→飽和」のため）。ただしエッジごとのカプセルSDF計算自体は両者で共通化できる。`self.target_img` は既存の raster タスクと同じ仕組み（`RasterLossArgs`/`target_img` 経由）でロードした `[0,1]` 画像をそのまま使う。**`img_mode` は `bow`（黒=前景を高密度として反転）を使うこと** — `wob` のままだと画像の余白（背景）が高密度、ロゴ/市街地形状が低密度に読み込まれ、意図と正反対になる。
 
 ## 4. 正則化（複雑さ＝建設コスト）
 
 ```
-cost = sum_e length_e * width_e * cost_weight
+cost = sum_e length_e * width_e ^ cost_width_exponent * cost_weight
 ```
 
-道路の長さ×幅（≒舗装面積）をコストとみなす。`Tri` の `node_weight`/`size_weight` に相当する役割を `cost_weight` が担う。`compute_simplicity` で各ネットワークについて集計する。
+道路の長さ×幅（≒舗装面積）をコストとみなす。`cost_width_exponent > 1` にすると、幅が広い道路（幹線道路）への罰則が幅に対して超線形に強くなる（デフォルト `2.5`。単純な線形だと `width_classes` の比率分しか差がつかず、幹線道路が乱立しやすかったため導入）。`Tri` の `node_weight`/`size_weight` に相当する役割を `cost_weight`（と `cost_width_exponent`）が担う。`compute_simplicity` で各ネットワークについて集計する。
 
 ## 5. `TaskArgs`（想定フィールド）
 
@@ -157,10 +170,15 @@ cost = sum_e length_e * width_e * cost_weight
 | `width_classes` | 選択可能な道路幅の離散値一覧 | 例: `(0.02, 0.05)`。Add系書き換えで各値を提案 |
 | `sigma0` | 最小到達半径（street相当） | 密度合成カーネルの基準スケール |
 | `k_sigma` | 幅→到達範囲の係数 | highway ほど広域に効くようにする |
-| `baseline_density` | 道路から離れた領域の最低密度 | 入力で直接指定する固定値 |
+| `reach_exponent` | 到達半径の幅に対する指数 | 1より大きいほど幹線道路の到達範囲だけ不釣り合いに拡大する |
+| `amp_scale` | ピーク強度の基準スケール（`amplitude_e = amp_scale/sigma_e`） | 到達範囲が広いほどピークが下がる |
+| `min_density_floor` | 人口密度の最低ライン | 損失側の非対称罰則（3.3節）で使う。forward modelには焼き込まない |
+| `underflow_weight` | 最低ラインを下回った分への追加罰則の重み | 大きいほど床割れを強く嫌う |
 | `cost_weight` | 建設コスト正則化の重み | `Tri.node_weight` に相当 |
+| `cost_width_exponent` | 建設コストの幅に対する指数 | 1より大きいほど幹線道路への罰則が強くなる |
 | `snap_radius` | スナップ候補とみなす最大距離（グリッドのセルサイズにも使う） | |
 | `default_length` / `length_range` | Add系書き換えの新規エッジ長 | |
+| `add_weight` / `add_free_weight` | `AddFromNode`/`AddFree` の候補数に比例した重み | `n_candidates * weight` 個の候補を生成する。値を下げると相対的にその書き換えが選ばれにくくなる |
 
 ## 6. 可視化
 
@@ -168,7 +186,7 @@ cost = sum_e length_e * width_e * cost_weight
 
 1. **背景**: `self.target_img`（target 人口密度）を `imshow(..., cmap="plasma", alpha=0.2)` で薄く表示
 2. **重ね書き**: `collection.compute_density(...)` で計算した予測密度を `imshow(..., cmap="magma", alpha=0.5〜0.6)` で表示（roadsから合成された密度そのものが主役なのでtargetより濃いめにする）
-3. **前景**: 道路網を線分として描画。`ax.ax.plot([x1, x2], [y1, y2], color="white", linewidth=width_to_pt(w))` のように、幅クラスごとに線の太さを変えてノード・エッジを描く（`Tree.visualize` の `Line2D` 描画パターンを流用）
+3. **前景**: 道路網を線分として描画。幅クラスごとに線の太さを変える。細い道路(street)が背景ヒートマップに埋もれて見えなくなる問題があったため、白の本体の下に一回り太い黒の「ケーシング」を先に描く（地図表現でよく使われる技法。`RoadNetwork.visualize` に実装済み）
 
 ```python
 def visualize(self, collection: ObjectCollection[RoadNetwork], step: int, loss: float, state: None) -> np.ndarray:
