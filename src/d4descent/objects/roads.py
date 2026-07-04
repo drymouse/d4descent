@@ -1172,14 +1172,18 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
         denom = (2 * v - 5).clamp(min=1.0)
         return cycles / denom
 
-    def get_angle_penalty(self, min_angle: float, exponent: float = 2.0) -> torch.Tensor:
+    def get_angle_penalty(self, exponent: float = 2.0, deadzone: float = 0.0) -> torch.Tensor:
         """
-        各ノードにおいて、そこに接続する道路同士の"隣接する"方向間の角度差(gap)が min_angle を
-        下回った分だけ (min_angle - gap)^exponent で罰する。鋭角に交わる不自然な交差点を減らし、
-        適度に開いた(=都市の道路網らしい)交差点を促す。次数1以下のノードは角度が定義できないため対象外。
+        各ノードにおいて、接続する道路同士の"隣接する"方向間の角度差(gap)が 90度の格子
+        {90°,180°,270°} からどれだけずれているかを罰する。90度で交わる交差点(理想の原則3)を
+        積極的に選好する: gapが 90/180/270°(=直進・直角カーブ・T字・十字)なら罰則0、鋭角(→0°)や
+        斜め(45°,135°)は罰される。次数1以下のノードは角度が定義できないため対象外。
 
-        ノード周りの各方向を角度順に並べたときの隣接gap(最後尾から先頭に戻る周回分も含む)を
-        すべて求める。次数dのノードには合計d個のgapがあり、その総和は必ず2πになる。
+        gap g に対し dev(g) = min(|g-90°|, |g-180°|, |g-270°|)、罰則 = relu(dev - deadzone)^exponent。
+        deadzone は 90度格子まわりの許容幅(この範囲内のずれは無罰。密度カバレッジとの過度な競合を防ぐ)。
+
+        ノード周りの各方向を角度順に並べたときの隣接gap(周回分も含む)をすべて求める。
+        次数dのノードには合計d個のgapがあり、その総和は必ず2πになる。
 
         returns: (n_networks,)
         """
@@ -1194,6 +1198,7 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
         other = torch.cat([self.edges[:, 1], self.edges[:, 0]])  # (2E,)
         vec = self.nodes[other] - self.nodes[center]  # (2E, 2)
         two_pi = 2 * math.pi
+        half_pi = math.pi / 2
         theta = torch.remainder(torch.atan2(vec[:, 1], vec[:, 0]), two_pi)  # [0, 2pi)
 
         # (center, theta) の順でソートすると、同一ノードに属する方向が角度順に並ぶ
@@ -1216,13 +1221,16 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
         degree.scatter_add_(0, self.edges.flatten(), torch.ones(2 * n_edges, dtype=torch.long, device=device))
         has_gaps = degree >= 2
 
-        intra_penalty = torch.where(
-            same_group, (min_angle - diffs).clamp(min=0.0).pow(exponent), torch.zeros_like(diffs)
-        )
+        def _lattice_penalty(g: torch.Tensor) -> torch.Tensor:
+            # 90度格子 {90,180,270}° への最短距離(0°/360°は"良い角度"に含めない=鋭角/針状を罰する)
+            dev = torch.minimum(
+                torch.minimum((g - half_pi).abs(), (g - math.pi).abs()), (g - 3 * half_pi).abs()
+            )
+            return (dev - deadzone).clamp(min=0.0).pow(exponent)
+
+        intra_penalty = torch.where(same_group, _lattice_penalty(diffs), torch.zeros_like(diffs))
         wrap_penalty = torch.where(
-            has_gaps,
-            (min_angle - wrap_gap).clamp(min=0.0).pow(exponent),
-            torch.zeros(total_nodes, dtype=theta.dtype, device=device),
+            has_gaps, _lattice_penalty(wrap_gap), torch.zeros(total_nodes, dtype=theta.dtype, device=device)
         )
 
         node_index_of = self._build_node_index_of()

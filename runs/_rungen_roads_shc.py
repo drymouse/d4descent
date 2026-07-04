@@ -16,14 +16,18 @@ def main():
     # task
     b.add("---task", "configs/tasks/roads.yaml")
     b.add("--task.cost_weight", 1e-3)
-    b.add("--task.cost_width_exponent", 2.5)  # 幹線道路(幅広)への罰則を幅に対して超線形に強くする
-    # 建設コストを連続最適化にも効かせ「最小限の道路で被覆」させる。幹線道路(幅広)ほど強く縮む。
-    # これがないと中央に冗長な幹線道路が団子状に溜まる(20付近が最適、大きすぎると道路網ごと消える)。
+    b.add("--task.cost_width_exponent", 2.5)  # 離散コスト: 幹線道路(幅広)の"追加"罰則を超線形に強くする
+    # 建設コストを連続最適化にも効かせ「最小限の道路で被覆」させる。冗長な道路を縮め追加も抑える。
     b.add("--task.size_weight", 20.0)
+    # 連続コストの幅指数。街路にコストを負担させようと下げると街路が崩壊するため離散と同じ2.5に保つ
+    # (街路の散らかり・疎密の作り分けは街路コストではなく下の90度罰則が担う)。
+    b.add("--task.size_width_exponent", 2.5)
     b.add("--task.mesh_weight", 0.05)  # ループ形成(meshedness)への報酬。都市らしい街区構造を促す
-    b.add("--task.min_angle", math.radians(45))  # RoadArgs.min_angle はラジアン
+    # 90度交差の選好(原則3)。gapが90度格子{90,180,270}°からずれることを罰する。街路を直交・直進させ、
+    # 低人口域への無秩序な蛇行も抑える(実験で街路の低人口域漏れ64%→11%、90度からのずれ37°→10°)。
+    b.add("--task.angle_deadzone", math.radians(10))  # 格子まわりの許容幅(ラジアン)
     b.add("--task.angle_penalty_exponent", 2.0)
-    b.add("--task.angle_weight", 0.02)  # 交差点が鋭角になりすぎることへの罰則
+    b.add("--task.angle_weight", 0.03)
     b.add("--task.road_collection_args.sigma0", 0.03)
     b.add("--task.road_collection_args.k_sigma", 300.0)
     b.add("--task.road_collection_args.reach_exponent", 2.5)  # 幹線道路の到達半径を不釣り合いに拡大

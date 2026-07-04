@@ -32,16 +32,19 @@ from ..losses.raster import RasterLossArgs
 
 @dataclass
 class RoadArgs(TaskArgs):
-    cost_weight: float = 1e-3  # 建設コスト(長さ×幅^cost_width_exponent)の"離散"正則化重み(compute_simplicity)。Triのnode_weightに相当
-    cost_width_exponent: float = 2.5  # 幅への指数。1より大きいほど幹線道路(幅広)への罰則が超線形に強くなる
+    cost_weight: float = 1e-3  # 建設コストの"離散"正則化重み(compute_simplicity)。Triのnode_weightに相当
+    cost_width_exponent: float = 2.5  # 離散コストの幅への指数。幹線道路(幅広)への"追加"罰則を超線形に強くする
     # 建設コストを"連続"損失(_compute_losses)にも直接加算する重み。Triのsize_weightに相当。
     # cost_weight(離散、書き換えの採否のみに影響)と違い、勾配降下でノード位置そのものに「道路を
-    # 短く・少なく」する力を与える。これがないと、一度できた冗長な道路(特にamaxで他の道路に負けて
-    # 密度的に無駄な中央の幹線道路)は縮む動機がなく、角度罰則・密度勾配で動き回って団子状に残る。
-    # width^cost_width_exponent 重みなので幹線道路(幅広)ほど強く縮む/追加が却下される。
-    # 「最小限の道路で被覆する」ための中心的な仕組み。cost_width_exponent=2.5前提で20前後が適切
-    # (大きすぎる(~60)と道路網ごと縮んで消える。密度MSEは画素平均なので描画解像度には概ね不変)。
+    # 短く・少なく」する力を与える。これがないと、一度できた冗長な道路は縮む動機がなく団子状に残る。
+    # 「最小限の道路で被覆する」ための中心的な仕組み。size_width_exponent=2.5前提で20前後が適切。
     size_weight: float = 20.0
+    # 連続建設コストの幅への指数。街路(幅0.02)にもコストを負担させようと指数を下げる(1.0〜2.0)と、
+    # 街路コストが密度カバレッジの利得(到達半径sigmaが小さく1本あたりの利得が小さい)を超えてしまい、
+    # 成長提案が全て却下されて道路網が種のまま崩壊する(実験で確認)。よって離散側と同じ2.5を使い、
+    # 「幹線道路=高コスト(疎に)/街路=低コスト(高人口域に密に)」の非対称を保つ。街路の散らかり・疎密の
+    # 作り分けは、街路コストを上げるのではなく後述の90度罰則(angle_weight)が実効的に担う。
+    size_width_exponent: float = 2.5
     mesh_weight: float = 0.05  # ループ形成(meshedness)への報酬の重み。大きいほどSnapでのループ化を優先する
     # target_img([0,1]の画像やshcのrender01など、入力元によらず同じ扱い)を実際の密度値にアフィン変換する:
     #   effective_target = target_outside_value + (target_inside_value - target_outside_value) * target_img
@@ -50,12 +53,13 @@ class RoadArgs(TaskArgs):
     # ロジックで解釈する。
     target_inside_value: float = 0.7
     target_outside_value: float = 0.15
-    # 交差点の角度が小さすぎる(道路同士がほぼ同じ方向を向いて鋭角に交わる)ことへの罰則。
-    # (min_angle - 実際の角度)^angle_penalty_exponent を連続損失に直接加算する
-    # (離散書き換えの採否・連続最適化どちらにも効かせるため compute_simplicity ではなく loss 側に入れる)。
-    min_angle: float = math.radians(45)
+    # 交差点が90度格子 {90°,180°,270°} からずれることへの罰則(原則3: 90度交差を選好)。
+    # get_angle_penalty が gap の格子からのずれを罰する。90/180/270°(直進・直角カーブ・T字・十字)は
+    # 無罰、鋭角(→0°)や斜め(45°,135°)を罰する。angle_deadzone は格子まわりの許容幅(密度カバレッジ
+    # との過度な競合を防ぐ)。連続損失に直接加算(勾配で道路の向きを90度方向へ動かすため)。
+    angle_deadzone: float = math.radians(10)
     angle_penalty_exponent: float = 2.0
-    angle_weight: float = 0.02
+    angle_weight: float = 0.03
     better_abs_eps: float = 1e-8
     rewrite_args: RoadRewriteArgs = field(default_factory=RoadRewriteArgs)
     road_collection_args: RoadCollectionArgs = field(default_factory=RoadCollectionArgs)
@@ -492,13 +496,15 @@ class RoadDensityTask(RoadTask[None]):
         # 最低ラインは compute_density 側で無条件保証済み(density は floor を下回らない)ので、
         # ここでは素直に target とのMSEのみでよい。
         loss = (density - self.target_img).square().flatten(-2).mean(dim=-1)
-        angle_penalty = collection.get_angle_penalty(self.args.min_angle, self.args.angle_penalty_exponent)
+        # 90度交差の選好(原則3)。gapの90度格子からのずれを罰する。
+        angle_penalty = collection.get_angle_penalty(self.args.angle_penalty_exponent, self.args.angle_deadzone)
         loss = loss + self.args.angle_weight * angle_penalty
         # 建設コストを連続損失にも加える(size_weight)。勾配がノード位置を動かして道路を短く保ち、
-        # 密度カバレッジに寄与しない冗長な道路(特に幹線道路)を縮め、追加提案の受理も抑える。
-        # → 「最小限の道路で被覆する」方向へ連続最適化を誘導する。
+        # 密度カバレッジに寄与しない冗長な道路を縮め、追加提案の受理も抑える。連続側は size_width_exponent
+        # (離散の cost_width_exponent とは別、街路にも意味あるコストを負担させる) を使う。
+        # → 「最小限の道路で被覆する / 疎密の作り分け」方向へ連続最適化を誘導する。
         if self.args.size_weight != 0.0:
-            cost = collection.get_construction_costs(width_exponent=self.args.cost_width_exponent)  # (n_networks,)
+            cost = collection.get_construction_costs(width_exponent=self.args.size_width_exponent)  # (n_networks,)
             loss = loss + self.args.size_weight * cost
         return loss, {}
 
