@@ -32,8 +32,16 @@ from ..losses.raster import RasterLossArgs
 
 @dataclass
 class RoadArgs(TaskArgs):
-    cost_weight: float = 1e-3  # 建設コスト(長さ×幅^cost_width_exponent)の正則化重み。Triのnode_weightに相当
-    cost_width_exponent: float = 2.0  # 幅への指数。1より大きいほど幹線道路(幅広)への罰則が超線形に強くなる
+    cost_weight: float = 1e-3  # 建設コスト(長さ×幅^cost_width_exponent)の"離散"正則化重み(compute_simplicity)。Triのnode_weightに相当
+    cost_width_exponent: float = 2.5  # 幅への指数。1より大きいほど幹線道路(幅広)への罰則が超線形に強くなる
+    # 建設コストを"連続"損失(_compute_losses)にも直接加算する重み。Triのsize_weightに相当。
+    # cost_weight(離散、書き換えの採否のみに影響)と違い、勾配降下でノード位置そのものに「道路を
+    # 短く・少なく」する力を与える。これがないと、一度できた冗長な道路(特にamaxで他の道路に負けて
+    # 密度的に無駄な中央の幹線道路)は縮む動機がなく、角度罰則・密度勾配で動き回って団子状に残る。
+    # width^cost_width_exponent 重みなので幹線道路(幅広)ほど強く縮む/追加が却下される。
+    # 「最小限の道路で被覆する」ための中心的な仕組み。cost_width_exponent=2.5前提で20前後が適切
+    # (大きすぎる(~60)と道路網ごと縮んで消える。密度MSEは画素平均なので描画解像度には概ね不変)。
+    size_weight: float = 20.0
     mesh_weight: float = 0.05  # ループ形成(meshedness)への報酬の重み。大きいほどSnapでのループ化を優先する
     # target_img([0,1]の画像やshcのrender01など、入力元によらず同じ扱い)を実際の密度値にアフィン変換する:
     #   effective_target = target_outside_value + (target_inside_value - target_outside_value) * target_img
@@ -486,6 +494,12 @@ class RoadDensityTask(RoadTask[None]):
         loss = (density - self.target_img).square().flatten(-2).mean(dim=-1)
         angle_penalty = collection.get_angle_penalty(self.args.min_angle, self.args.angle_penalty_exponent)
         loss = loss + self.args.angle_weight * angle_penalty
+        # 建設コストを連続損失にも加える(size_weight)。勾配がノード位置を動かして道路を短く保ち、
+        # 密度カバレッジに寄与しない冗長な道路(特に幹線道路)を縮め、追加提案の受理も抑える。
+        # → 「最小限の道路で被覆する」方向へ連続最適化を誘導する。
+        if self.args.size_weight != 0.0:
+            cost = collection.get_construction_costs(width_exponent=self.args.cost_width_exponent)  # (n_networks,)
+            loss = loss + self.args.size_weight * cost
         return loss, {}
 
     def visualize(self, collection: ObjectCollection[RoadNetwork], step: int, loss: float, state: None) -> np.ndarray:

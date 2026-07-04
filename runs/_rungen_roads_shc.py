@@ -17,6 +17,9 @@ def main():
     b.add("---task", "configs/tasks/roads.yaml")
     b.add("--task.cost_weight", 1e-3)
     b.add("--task.cost_width_exponent", 2.5)  # 幹線道路(幅広)への罰則を幅に対して超線形に強くする
+    # 建設コストを連続最適化にも効かせ「最小限の道路で被覆」させる。幹線道路(幅広)ほど強く縮む。
+    # これがないと中央に冗長な幹線道路が団子状に溜まる(20付近が最適、大きすぎると道路網ごと消える)。
+    b.add("--task.size_weight", 20.0)
     b.add("--task.mesh_weight", 0.05)  # ループ形成(meshedness)への報酬。都市らしい街区構造を促す
     b.add("--task.min_angle", math.radians(45))  # RoadArgs.min_angle はラジアン
     b.add("--task.angle_penalty_exponent", 2.0)
