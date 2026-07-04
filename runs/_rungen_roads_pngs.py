@@ -33,7 +33,7 @@ def main():
     b.add("--task.rewrite_args.length_range", [0.05, 0.15])
     b.add("--task.rewrite_args.snap_radius", 0.05)
     b.add("--task.rewrite_args.add_weight", 3.0)  # 先端から伸ばす確率を上げる
-    b.add("--task.rewrite_args.add_free_weight", 0.15)  # 任意の場所への追加確率を下げる
+    b.add("--task.rewrite_args.add_anywhere_weight", 0.15)  # 遠方への鎖接続(旧AddFree)の確率を下げる
     # optim
     b.add("--optim.proposal_trigger", "step")
     b.add("--optim.propose_every", 25)

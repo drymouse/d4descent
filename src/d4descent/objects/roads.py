@@ -14,13 +14,26 @@ from ..visualizer import MPLVisualizerAxes
 
 # region Rewrites
 # ================== Rewrites ===========================
+#
+# 4性質(Reversibility/Jump Continuity/Local Geometric Control/Repairability, design-for-descent論文Table1)
+# に基づく再設計(docs/road_grammar_plan.md 9節)。連結性・幹線道路の階層性は罰則ではなく
+# 「そもそも違反する提案を生成しない」という書き換えの生成条件で保証する。
+#
+# 不変条件A(連結性): AddFree(孤立道路の追加)を廃止。新規ノードは必ず既存ノードから繋がった形でのみ追加する。
+# 不変条件B(幹線道路の階層性): highway(width_classesの最大値)エッジは、既にhighwayエッジに
+#   接しているノード(=highway適格ノード)からしか生えない。streetはhighway/street問わずどこからでも生える。
 
 
 class RoadRewriteType(Enum):
     Add = 1
-    AddFree = 2
+    AddAnywhere = 2
     Remove = 3
-    Snap = 4
+    Split = 4
+    Merge = 5
+    Snap = 6
+    Unsnap = 7
+    Widen = 8
+    Narrow = 9
 
 
 @dataclass
@@ -30,7 +43,7 @@ class RoadRewrite:
 
 @dataclass
 class RoadRewriteAdd(RoadRewrite):
-    """既存ノード from_node から新規ノード (x, y) へ道を伸ばす。分岐も同じ操作（from_node の次数が増えるだけ）。"""
+    """既存ノード from_node から新規ノード (x, y) へ道を伸ばす(epsilon長)。逆操作: Remove。"""
 
     rewrite_type: RoadRewriteType = field(default=RoadRewriteType.Add, init=False)
     from_node: int
@@ -40,26 +53,59 @@ class RoadRewriteAdd(RoadRewrite):
 
 
 @dataclass
-class RoadRewriteAddFree(RoadRewrite):
-    """既存構造と繋がらない新規孤立道路（2ノード+1エッジ）を追加する。"""
+class RoadRewriteAddAnywhere(RoadRewrite):
+    """
+    既存の適格ノード from_node から、空間中の任意の点まで新規ノードの鎖(pts)で繋がったまま到達する。
+    Tree.AddAnywhere と同型(Local Geometric Control: 遠方への局所変更)。鎖の長さは距離に応じて可変。
+    逆操作: 鎖の末端から Remove を繰り返す。
+    """
 
-    rewrite_type: RoadRewriteType = field(default=RoadRewriteType.AddFree, init=False)
-    x1: float
-    y1: float
-    x2: float
-    y2: float
+    rewrite_type: RoadRewriteType = field(default=RoadRewriteType.AddAnywhere, init=False)
+    from_node: int
+    pts: tuple[tuple[float, float], ...]  # 1個以上。各hopの終点座標(最後の要素がtarget点そのもの)
     width: float
 
 
 @dataclass
 class RoadRewriteRemove(RoadRewrite):
+    """次数1(末端)のエッジを削除する。末端なので常に連結性を壊さない。逆操作: Add/AddAnywhere。"""
+
     rewrite_type: RoadRewriteType = field(default=RoadRewriteType.Remove, init=False)
     edge_id: int
 
 
 @dataclass
+class RoadRewriteSplit(RoadRewrite):
+    """
+    エッジを (x,y) の位置で同じ幅クラスの2本に分割する。分割前と全く同じ位置なので形状は変化しない
+    (Jump Continuity、論文の"局所的なセグメント分割"の例そのもの)。逆操作: Merge。
+    """
+
+    rewrite_type: RoadRewriteType = field(default=RoadRewriteType.Split, init=False)
+    edge_id: int
+    x: float
+    y: float
+
+
+@dataclass
+class RoadRewriteMerge(RoadRewrite):
+    """
+    次数2のノードで、両側のエッジが同じ幅クラスかつほぼ共線の場合に1本へ統合する。逆操作: Split。
+    outer_a/outer_b はノード削除側(node_id)の外側にある2つの隣接ノード。
+    """
+
+    rewrite_type: RoadRewriteType = field(default=RoadRewriteType.Merge, init=False)
+    node_id: int
+    edge_id_a: int
+    edge_id_b: int
+    outer_a: int
+    outer_b: int
+    width: float
+
+
+@dataclass
 class RoadRewriteSnap(RoadRewrite):
-    """edge_id の end側(0 or 1)の端点(次数1のぶら下がりノード)を、既存ノード target_node に張り替える。"""
+    """edge_id の end側(0 or 1)の端点(次数1のぶら下がりノード)を、既存ノード target_node に張り替える。逆操作: Unsnap。"""
 
     rewrite_type: RoadRewriteType = field(default=RoadRewriteType.Snap, init=False)
     edge_id: int
@@ -68,28 +114,70 @@ class RoadRewriteSnap(RoadRewrite):
 
 
 @dataclass
+class RoadRewriteUnsnap(RoadRewrite):
+    """
+    サイクル上のエッジ(=削除しても連結性を壊さないエッジ)の一端を、同じ座標に複製した新規ノードへ
+    付け替え、ぶら下がった端点に戻す(形状は瞬間的に不変)。Snapの逆操作(論文のAdd/Remove-Loop例)。
+    """
+
+    rewrite_type: RoadRewriteType = field(default=RoadRewriteType.Unsnap, init=False)
+    edge_id: int
+    end: int
+
+
+@dataclass
+class RoadRewriteWiden(RoadRewrite):
+    """
+    エッジの幅クラスを格上げする(例: street -> highway)。少なくとも片方の端点が既にhighwayに
+    接している場合のみ許可(不変条件Bを維持するため)。逆操作: Narrow。
+    """
+
+    rewrite_type: RoadRewriteType = field(default=RoadRewriteType.Widen, init=False)
+    edge_id: int
+    new_width: float
+
+
+@dataclass
+class RoadRewriteNarrow(RoadRewrite):
+    """エッジの幅クラスを格下げする(例: highway -> street)。逆操作: Widen。"""
+
+    rewrite_type: RoadRewriteType = field(default=RoadRewriteType.Narrow, init=False)
+    edge_id: int
+    new_width: float
+
+
+@dataclass
 class RoadRewriteArgs:
-    width_classes: tuple[float, ...] = (0.02, 0.05)
+    width_classes: tuple[float, ...] = (0.02, 0.05)  # 昇順。最後の要素をhighway(幹線道路)とみなす
     length_range: tuple[float, float] = (0.05, 0.15)
     n_add_candidates: int = 32
-    n_free_candidates: int = 8
+    n_add_anywhere_candidates: int = 8
+    n_split_candidates: int = 16
     snap_radius: float = 0.05
+    merge_angle_eps: float = math.radians(5.0)  # 反対方向(=直線)からのずれがこれ以内ならMerge可
+    unsnap_bfs_budget: int = 256  # Unsnap候補の連結性チェック(BFS)で訪問するノード数の上限
     add_weight: float = 1.0
-    add_free_weight: float = 1.0
+    add_anywhere_weight: float = 1.0
     remove_weight: float = 1.0
+    split_weight: float = 1.0
+    merge_weight: float = 1.0
     snap_weight: float = 1.0
+    unsnap_weight: float = 1.0
+    widen_weight: float = 1.0
+    narrow_weight: float = 1.0
+
+    def __post_init__(self):
+        assert list(self.width_classes) == sorted(self.width_classes), "width_classes must be ascending"
 
 
-def find_nearby_nodes(
-    nodes: torch.Tensor, query_idx: torch.Tensor, cell_size: float, radius: float
-) -> list[list[int]]:
+def find_nearby_nodes(nodes: torch.Tensor, query_idx: torch.Tensor, cell_size: float, radius: float) -> list[list[int]]:
     """
-    一様グリッドによる空間ハッシュで近傍探索を行う（全ペア総当たりのO(n^2)を避ける）。
+    一様グリッドによる空間ハッシュで近傍探索を行う(全ペア総当たりのO(n^2)を避ける)。
     セルサイズ=radius とすることで、自セル+周囲8近傍だけを調べればよい。
 
     nodes: (n_nodes, 2)
     query_idx: (k,) 近傍を調べたいノードのインデックス
-    returns: 各クエリについて、半径内にある他ノードのインデックス（距離の近い順）
+    returns: 各クエリについて、半径内にある他ノードのインデックス(距離の近い順)
     """
     with torch.no_grad():
         pos = nodes.detach().cpu().numpy()
@@ -115,6 +203,60 @@ def find_nearby_nodes(
             cands.sort(key=lambda t: t[0])
             results.append([j for _, j in cands])
     return results
+
+
+def _is_reachable_without_edge(
+    adj: list[list[tuple[int, int]]],
+    exclude_edge: int,
+    start: int,
+    target: int,
+    budget: int,
+    edge_mask: Optional[list[bool]] = None,
+) -> bool:
+    """
+    exclude_edge を除いたグラフ(edge_maskが渡された場合はさらに edge_mask[eid]==True のエッジのみ)で
+    start から target に到達できるかをBFSで判定する。budgetを超えたら安全側(=False, 到達不可とみなす)
+    を返す(Unsnapが誤って連結性を壊す側には倒れない)。
+    """
+    if start == target:
+        return True
+    visited = {start}
+    queue = [start]
+    steps = 0
+    while queue:
+        cur = queue.pop()
+        for nbr, eid in adj[cur]:
+            if eid == exclude_edge:
+                continue
+            if edge_mask is not None and not edge_mask[eid]:
+                continue
+            if nbr == target:
+                return True
+            if nbr in visited:
+                continue
+            visited.add(nbr)
+            queue.append(nbr)
+            steps += 1
+            if steps > budget:
+                return False
+    return False
+
+
+def _seg_intersect_2d(
+    p: torch.Tensor, q: torch.Tensor, r: torch.Tensor, s: torch.Tensor
+) -> tuple[bool, torch.Tensor]:
+    """p->q, r->s の2線分が(端点近傍を除いて)交差するか判定する。交差する場合は交点も返す。"""
+    v = q - p
+    w = s - r
+    denom = v[0] * w[1] - v[1] * w[0]
+    if denom.abs() < 1e-9:
+        return False, p
+    diff = r - p
+    t = (diff[0] * w[1] - diff[1] * w[0]) / denom
+    u = (diff[0] * v[1] - diff[1] * v[0]) / denom
+    if 0.02 < t.item() < 0.98 and 0.02 < u.item() < 0.98:
+        return True, p + v * t
+    return False, p
 
 
 # endregion
@@ -146,7 +288,9 @@ class RoadNetwork:
     def _degree(self) -> torch.Tensor:
         n_nodes = len(self.nodes)
         degree = torch.zeros(n_nodes, dtype=torch.long, device=self.nodes.device)
-        degree.scatter_add_(0, self.edges.flatten(), torch.ones(2 * len(self.edges), dtype=torch.long, device=self.nodes.device))
+        degree.scatter_add_(
+            0, self.edges.flatten(), torch.ones(2 * len(self.edges), dtype=torch.long, device=self.nodes.device)
+        )
         return degree
 
     def visualize(
@@ -160,7 +304,7 @@ class RoadNetwork:
     ) -> None:
         """
         背景のヒートマップに埋もれないよう、白の道路本体の下に一回り太い黒のケーシングを描く
-        （地図でよく使われる技法）。細い道（street）でも min_lw を確保して視認できるようにする。
+        (地図でよく使われる技法)。細い道(street)でも min_lw を確保して視認できるようにする。
         """
         widths = self.widths.tolist()
         if not widths:
@@ -171,7 +315,9 @@ class RoadNetwork:
         for (i, j), w in zip(self.edges.tolist(), widths):
             (x0, y0), (x1, y1) = nodes[i], nodes[j]
             lw = min_lw + (max_lw - min_lw) * (w - min_w) / span
-            ax.ax.plot([x0, x1], [y0, y1], color=casing_color, linewidth=lw + casing_extra, solid_capstyle="round", zorder=4)
+            ax.ax.plot(
+                [x0, x1], [y0, y1], color=casing_color, linewidth=lw + casing_extra, solid_capstyle="round", zorder=4
+            )
             ax.ax.plot([x0, x1], [y0, y1], color=color, linewidth=lw, solid_capstyle="round", zorder=5)
 
     def prune_orphan_nodes(self) -> "RoadNetwork":
@@ -191,18 +337,88 @@ class RoadNetwork:
             payload=self.payload,
         )
 
+    @torch.no_grad()
+    def cleanup(self, max_iter: int = 4) -> "RoadNetwork":
+        """
+        共有ノードを持たずに幾何的に交差してしまった2辺(勾配降下でノード位置が動いた結果生じうる)
+        を検出し、交点に新規ノードを1つ挿入して両辺をそこで分割する(Repairability、9.3節)。
+        制約「交差する道路は必ずノードを共有する」に対する修復操作。
+        """
+        net = self
+        for _ in range(max_iter):
+            n_edges = len(net.edges)
+            if n_edges < 2:
+                break
+            pos = net.nodes.detach()
+            edges_list = net.edges.tolist()
+            found: Optional[tuple[int, int, torch.Tensor]] = None
+            for i in range(n_edges):
+                a, b = edges_list[i]
+                for j in range(i + 1, n_edges):
+                    c, d = edges_list[j]
+                    if len({a, b, c, d}) < 4:
+                        continue  # ノードを共有している(隣接エッジ)ので交差ではない
+                    hit, pt = _seg_intersect_2d(pos[a], pos[b], pos[c], pos[d])
+                    if hit:
+                        found = (i, j, pt)
+                        break
+                if found is not None:
+                    break
+            if found is None:
+                break
+            i, j, pt = found
+            a, b = edges_list[i]
+            c, d = edges_list[j]
+            n0 = len(net.nodes)
+            w_i = net.widths[i : i + 1]
+            w_j = net.widths[j : j + 1]
+            keep = torch.ones(n_edges, dtype=torch.bool, device=net.nodes.device)
+            keep[i] = False
+            keep[j] = False
+            new_node = pt.unsqueeze(0)
+            new_edges = torch.tensor([[a, n0], [n0, b], [c, n0], [n0, d]], dtype=torch.long, device=net.nodes.device)
+            net = RoadNetwork(
+                nodes=torch.cat([net.nodes, new_node], dim=0),
+                edges=torch.cat([net.edges[keep], new_edges], dim=0),
+                widths=torch.cat([net.widths[keep], w_i, w_i, w_j, w_j], dim=0),
+                id=net.id,
+                payload=net.payload,
+            )
+        return net
+
     def gen_rewrite_specs(self, args: RoadRewriteArgs, lim: tuple[float, float]) -> list[RoadRewrite]:
         device = self.nodes.device
+        n_nodes = len(self.nodes)
         n_edges = len(self.edges)
         degree = self._degree()
         live_nodes = degree.nonzero().flatten().tolist()
         leaf_nodes = (degree == 1).nonzero().flatten().tolist()
+        pos = self.nodes.detach().cpu()
+        edges_list = self.edges.tolist()
+        widths_list = self.widths.tolist()
+        max_width = max(args.width_classes)
+        min_width = min(args.width_classes)
+
+        is_highway_edge = [w >= max_width - 1e-9 for w in widths_list]
+        n_highway_edges = sum(is_highway_edge)
+
+        highway_incident = [0] * n_nodes
+        for (a, b), hw in zip(edges_list, is_highway_edge):
+            if hw:
+                highway_incident[a] += 1
+                highway_incident[b] += 1
+        highway_eligible = [c > 0 for c in highway_incident]  # 不変条件B: highwayはここからしか生えない
+
+        adj: list[list[tuple[int, int]]] = [[] for _ in range(n_nodes)]
+        for eid, (a, b) in enumerate(edges_list):
+            adj[a].append((b, eid))
+            adj[b].append((a, eid))
 
         specs: list[RoadRewrite] = []
 
+        # ---- Add: 既存ノードから短い新規エッジを伸ばす(epsilon長, Jump Continuity) ----
         if args.add_weight > 0 and live_nodes:
             n_cand = max(round(args.n_add_candidates * args.add_weight), 1)
-            pos = self.nodes.detach().cpu()
             for _ in range(n_cand):
                 ni = random.choice(live_nodes)
                 ang = random.random() * 2 * math.pi
@@ -211,44 +427,138 @@ class RoadNetwork:
                 x1 = x0 + length * math.cos(ang)
                 y1 = y0 + length * math.sin(ang)
                 for w in args.width_classes:
+                    if w >= max_width - 1e-9 and not highway_eligible[ni]:
+                        continue  # 不変条件B
                     specs.append(RoadRewriteAdd(from_node=ni, x=x1, y=y1, width=w))
 
-        if args.add_free_weight > 0:
-            n_cand = max(round(args.n_free_candidates * args.add_free_weight), 1)
+        # ---- AddAnywhere: 遠方の任意の点へ、最も近い適格ノードから鎖で繋がったまま到達する ----
+        # (Local Geometric Control。不変条件Aを満たすため、AddFreeの代替として孤立配置は行わない)
+        if args.add_anywhere_weight > 0 and live_nodes:
+            n_cand = max(round(args.n_add_anywhere_candidates * args.add_anywhere_weight), 1)
             lim0, lim1 = lim
+            max_len = args.length_range[1]
             for _ in range(n_cand):
-                x0 = random.uniform(lim0, lim1)
-                y0 = random.uniform(lim0, lim1)
-                ang = random.random() * 2 * math.pi
-                length = random.uniform(*args.length_range)
-                x1 = x0 + length * math.cos(ang)
-                y1 = y0 + length * math.sin(ang)
+                tx = random.uniform(lim0, lim1)
+                ty = random.uniform(lim0, lim1)
+                target = torch.tensor([tx, ty])
                 for w in args.width_classes:
-                    specs.append(RoadRewriteAddFree(x1=x0, y1=y0, x2=x1, y2=y1, width=w))
+                    is_hw = w >= max_width - 1e-9
+                    eligible = [ni for ni in live_nodes if (highway_eligible[ni] if is_hw else True)]
+                    if not eligible:
+                        continue
+                    cand_pos = pos[eligible]  # (k, 2)
+                    d = (cand_pos - target).norm(dim=-1)
+                    best = int(d.argmin().item())
+                    from_node = eligible[best]
+                    dist = float(d[best].item())
+                    if dist < 1e-6:
+                        continue
+                    x0, y0 = pos[from_node].tolist()
+                    n_hops = max(1, math.ceil(dist / max_len))
+                    pts = tuple(
+                        (x0 + (tx - x0) * (k / n_hops), y0 + (ty - y0) * (k / n_hops)) for k in range(1, n_hops + 1)
+                    )
+                    specs.append(RoadRewriteAddAnywhere(from_node=from_node, pts=pts, width=w))
 
+        # ---- Remove: 末端エッジの削除(常に連結性を壊さない) ----
         if args.remove_weight > 0 and n_edges > 1:
-            edges_list = self.edges.tolist()
             for eid, (a, b) in enumerate(edges_list):
                 if degree[a].item() == 1 or degree[b].item() == 1:
+                    if is_highway_edge[eid] and n_highway_edges <= 1:
+                        continue  # 最後の幹線道路は消せない(不変条件B: highwayサブグラフを空にしない)
                     specs.append(RoadRewriteRemove(edge_id=eid))
 
+        # ---- Split: エッジをその場で2分割(形状不変, Jump Continuityの直接例) ----
+        if args.split_weight > 0 and n_edges > 0:
+            n_cand = max(round(args.n_split_candidates * args.split_weight), 1)
+            for _ in range(n_cand):
+                eid = random.randrange(n_edges)
+                a, b = edges_list[eid]
+                t = random.uniform(0.05, 0.95)
+                x0, y0 = pos[a].tolist()
+                x1, y1 = pos[b].tolist()
+                specs.append(RoadRewriteSplit(edge_id=eid, x=x0 + (x1 - x0) * t, y=y0 + (y1 - y0) * t))
+
+        # ---- Merge: 同幅・ほぼ共線の次数2ノードを統合(Splitの逆操作) ----
+        if args.merge_weight > 0:
+            for ni in live_nodes:
+                if degree[ni].item() != 2:
+                    continue
+                (n0, e0), (n1, e1) = adj[ni]
+                if n0 == n1:
+                    continue  # 2重辺は対象外
+                if widths_list[e0] != widths_list[e1]:
+                    continue
+                p_c, p0, p1 = pos[ni], pos[n0], pos[n1]
+                v0, v1 = p0 - p_c, p1 - p_c
+                ang0 = math.atan2(v0[1].item(), v0[0].item())
+                ang1 = math.atan2(v1[1].item(), v1[0].item())
+                diff = abs((ang0 - ang1 + math.pi) % (2 * math.pi) - math.pi)
+                if abs(diff - math.pi) > args.merge_angle_eps:
+                    continue  # 直線からずれすぎている(実際の交差点/曲がり角)ので統合不可
+                specs.append(
+                    RoadRewriteMerge(
+                        node_id=ni, edge_id_a=e0, edge_id_b=e1, outer_a=n0, outer_b=n1, width=widths_list[e0]
+                    )
+                )
+
+        # ---- Snap: ぶら下がった端点を既存ノードに接続してループ/交差点を作る ----
         if args.snap_weight > 0 and leaf_nodes:
-            edges_list = self.edges.tolist()
-            incident: dict[int, tuple[int, int]] = {}
+            incident_leaf: dict[int, tuple[int, int]] = {}
             for eid, (a, b) in enumerate(edges_list):
                 if degree[a].item() == 1:
-                    incident[a] = (eid, 0)
+                    incident_leaf[a] = (eid, 0)
                 if degree[b].item() == 1:
-                    incident[b] = (eid, 1)
+                    incident_leaf[b] = (eid, 1)
             leaf_idx_t = torch.tensor(leaf_nodes, dtype=torch.long, device=device)
             neighbor_lists = find_nearby_nodes(self.nodes, leaf_idx_t, cell_size=args.snap_radius, radius=args.snap_radius)
             for leaf, neighbors in zip(leaf_nodes, neighbor_lists):
-                eid, end = incident[leaf]
+                eid, end = incident_leaf[leaf]
                 other = edges_list[eid][1 - end]
+                edge_is_hw = is_highway_edge[eid]
                 for target in neighbors:
                     if target == other or target == leaf:
                         continue
+                    if edge_is_hw and not highway_eligible[target]:
+                        continue  # 不変条件B: highwayはhighway適格ノードにしかスナップできない
                     specs.append(RoadRewriteSnap(edge_id=eid, end=end, target_node=target))
+
+        # ---- Unsnap: サイクル上のエッジを開放してぶら下がり端点に戻す(Snapの逆操作) ----
+        if args.unsnap_weight > 0:
+            for eid, (a, b) in enumerate(edges_list):
+                if degree[a].item() < 2 or degree[b].item() < 2:
+                    continue  # 片方が次数1(leaf)ならブリッジ確定なので対象外
+                if not _is_reachable_without_edge(adj, eid, a, b, args.unsnap_bfs_budget):
+                    continue  # ブリッジ(削除すると非連結)なので対象外(不変条件A)
+                if is_highway_edge[eid] and not _is_reachable_without_edge(
+                    adj, eid, a, b, args.unsnap_bfs_budget, edge_mask=is_highway_edge
+                ):
+                    continue  # highwayサブグラフ限定でもサイクル上であることを要求(不変条件B)
+                for end in (0, 1):
+                    specs.append(RoadRewriteUnsnap(edge_id=eid, end=end))
+
+        # ---- Widen / Narrow: 幅クラスの格上げ/格下げ(互いに逆操作) ----
+        if len(args.width_classes) >= 2:
+            for eid, w in enumerate(widths_list):
+                a, b = edges_list[eid]
+                if args.widen_weight > 0 and w < max_width - 1e-9:
+                    # 昇格後もhighwayサブグラフの連結性を保てるのは、どちらかの端点が既にhighwayに
+                    # 接している場合のみ(不変条件B)
+                    if highway_incident[a] > 0 or highway_incident[b] > 0:
+                        for nw in args.width_classes:
+                            if nw > w:
+                                specs.append(RoadRewriteWiden(edge_id=eid, new_width=nw))
+                if args.narrow_weight > 0 and w > min_width:
+                    if is_highway_edge[eid]:
+                        if n_highway_edges <= 1:
+                            continue  # 最後のhighwayエッジは空にできない(不変条件B)
+                        if not _is_reachable_without_edge(
+                            adj, eid, a, b, args.unsnap_bfs_budget, edge_mask=is_highway_edge
+                        ):
+                            continue  # highwayサブグラフ内のブリッジ辺。格下げするとhighway網が分断される(不変条件B)
+                    for nw in args.width_classes:
+                        if nw < w:
+                            specs.append(RoadRewriteNarrow(edge_id=eid, new_width=nw))
 
         return specs
 
@@ -264,32 +574,124 @@ class RoadNetwork:
                 edges=torch.cat([self.edges, new_edge], dim=0),
                 widths=torch.cat([self.widths, new_width], dim=0),
             )
-        elif isinstance(spec, RoadRewriteAddFree):
+        elif isinstance(spec, RoadRewriteAddAnywhere):
             n0 = len(self.nodes)
-            new_nodes = torch.tensor([[spec.x1, spec.y1], [spec.x2, spec.y2]], dtype=dtype, device=device)
-            new_edge = torch.tensor([[n0, n0 + 1]], dtype=torch.long, device=device)
-            new_width = torch.tensor([spec.width], dtype=dtype, device=device)
+            k = len(spec.pts)
+            new_nodes = torch.tensor(list(spec.pts), dtype=dtype, device=device)  # (k,2)
+            starts = torch.tensor([spec.from_node] + list(range(n0, n0 + k - 1)), dtype=torch.long, device=device)
+            ends = torch.arange(n0, n0 + k, dtype=torch.long, device=device)
+            new_edges = torch.stack([starts, ends], dim=-1)
+            new_widths = torch.full((k,), spec.width, dtype=dtype, device=device)
             return RoadNetwork(
                 nodes=torch.cat([self.nodes, new_nodes], dim=0),
-                edges=torch.cat([self.edges, new_edge], dim=0),
-                widths=torch.cat([self.widths, new_width], dim=0),
+                edges=torch.cat([self.edges, new_edges], dim=0),
+                widths=torch.cat([self.widths, new_widths], dim=0),
             )
         elif isinstance(spec, RoadRewriteRemove):
             keep = torch.ones(len(self.edges), dtype=torch.bool, device=device)
             keep[spec.edge_id] = False
             return RoadNetwork(nodes=self.nodes, edges=self.edges[keep], widths=self.widths[keep])
+        elif isinstance(spec, RoadRewriteSplit):
+            n0 = len(self.nodes)
+            a, b = self.edges[spec.edge_id].tolist()
+            w = self.widths[spec.edge_id : spec.edge_id + 1]
+            new_node = torch.tensor([[spec.x, spec.y]], dtype=dtype, device=device)
+            keep = torch.ones(len(self.edges), dtype=torch.bool, device=device)
+            keep[spec.edge_id] = False
+            new_edges = torch.tensor([[a, n0], [n0, b]], dtype=torch.long, device=device)
+            return RoadNetwork(
+                nodes=torch.cat([self.nodes, new_node], dim=0),
+                edges=torch.cat([self.edges[keep], new_edges], dim=0),
+                widths=torch.cat([self.widths[keep], w, w], dim=0),
+            )
+        elif isinstance(spec, RoadRewriteMerge):
+            keep = torch.ones(len(self.edges), dtype=torch.bool, device=device)
+            keep[spec.edge_id_a] = False
+            keep[spec.edge_id_b] = False
+            new_edge = torch.tensor([[spec.outer_a, spec.outer_b]], dtype=torch.long, device=device)
+            new_width = torch.tensor([spec.width], dtype=dtype, device=device)
+            return RoadNetwork(
+                nodes=self.nodes,
+                edges=torch.cat([self.edges[keep], new_edge], dim=0),
+                widths=torch.cat([self.widths[keep], new_width], dim=0),
+            )
         elif isinstance(spec, RoadRewriteSnap):
             new_edges = self.edges.clone()
             new_edges[spec.edge_id, spec.end] = spec.target_node
             return RoadNetwork(nodes=self.nodes, edges=new_edges, widths=self.widths)
+        elif isinstance(spec, RoadRewriteUnsnap):
+            n0 = len(self.nodes)
+            old_node = int(self.edges[spec.edge_id, spec.end].item())
+            new_node = self.nodes[old_node : old_node + 1].clone()
+            new_edges = self.edges.clone()
+            new_edges[spec.edge_id, spec.end] = n0
+            return RoadNetwork(nodes=torch.cat([self.nodes, new_node], dim=0), edges=new_edges, widths=self.widths)
+        elif isinstance(spec, (RoadRewriteWiden, RoadRewriteNarrow)):
+            new_widths = self.widths.clone()
+            new_widths[spec.edge_id] = spec.new_width
+            return RoadNetwork(nodes=self.nodes, edges=self.edges, widths=new_widths)
         else:
             raise ValueError(f"Unknown rewrite {spec}")
 
-    def apply_all_rewrites(self, rewrites: list[RoadRewrite], scores: list[float]) -> "RoadNetwork":
-        """スコア降順で適用する。同じエッジを対象とする Remove/Snap は先勝ちとし、以降は無視する。"""
+    def apply_rewrite_each(self, specs: list[RoadRewrite]) -> list["RoadNetwork"]:
+        return [self.apply_rewrite(spec) for spec in specs]
+
+    def apply_all_rewrites(
+        self, rewrites: list[RoadRewrite], scores: list[float], max_width: Optional[float] = None
+    ) -> "RoadNetwork":
+        """
+        スコア降順で適用する。同じエッジを対象とする書き換えは先勝ちとし、以降は無視する。
+
+        Unsnap/Narrow は「削除/格下げしても連結性(該当ならhighwayサブグラフの連結性も)を壊さないか」を
+        gen_rewrite_specs 時点のスナップショットに対してチェック済みだが、**同じバッチ内の他の書き換え**
+        (別のUnsnap/Narrowなど)と組み合わせた結果、初めて非連結になるケースがある。これを防ぐため、
+        このバッチ内で既に確定した変更を反映した最新のグラフ状態に対して都度再検証する。
+
+        また Merge/Remove は対象ノード(node_id/末端ノード)を孤立させる操作であるため、同じバッチ内の
+        別の Add/AddAnywhere/Snap が"孤立する側"に新しい枝を付けてしまうと、その枝ごと本体から切り離される
+        (見た目上は消えていないのに実体は非連結、というバグになる)。これを防ぐため、ノードごとに
+        "orphaned"(孤立させる操作が確定済み)/"attached"(新しい接続が確定済み)を記録し、
+        孤立操作は既に何らかの記録があるノードには適用せず、接続操作は既に孤立確定済みのノードには
+        接続しないようにする(複数のAdd/Snapを同じノードから同時に生やすことは引き続き許可する)。
+
+        ノード削除・再インデックスはここでは行わない(orphanは Task.cleanup が prune_orphan_nodes で処理)。
+        max_width が渡された場合はhighwayサブグラフの連結性チェックも行う(不変条件B)。
+        """
         order = sorted(range(len(rewrites)), key=lambda i: scores[i], reverse=True)
         device = self.nodes.device
         dtype = self.nodes.dtype
+        base_degree = self._degree().tolist()
+
+        # このバッチ内で確定した変更を反映した「現在のグラフ」を軽量なPython辞書で追跡する
+        # (Unsnap/Narrowの動的な安全性チェックにのみ使う。最終的なテンソルはこの関数の最後で1回だけ構築する)
+        live_edges: dict[int, tuple[int, int, float]] = {
+            eid: (a, b, w) for eid, ((a, b), w) in enumerate(zip(self.edges.tolist(), self.widths.tolist()))
+        }
+        next_edge_id = len(self.edges)
+        node_status: dict[int, str] = {}  # node_id -> "orphaned" | "attached"
+
+        def _reachable(exclude_eid: int, start: int, target: int, highway_only: bool = False) -> bool:
+            if start == target:
+                return True
+            adj: dict[int, list[tuple[int, int]]] = {}
+            for eid, (a, b, w) in live_edges.items():
+                if eid == exclude_eid:
+                    continue
+                if highway_only and (max_width is None or w < max_width - 1e-9):
+                    continue
+                adj.setdefault(a, []).append((b, eid))
+                adj.setdefault(b, []).append((a, eid))
+            visited = {start}
+            stack = [start]
+            while stack:
+                cur = stack.pop()
+                for nb, eid2 in adj.get(cur, []):
+                    if nb == target:
+                        return True
+                    if nb not in visited:
+                        visited.add(nb)
+                        stack.append(nb)
+            return False
 
         added_nodes: list[torch.Tensor] = []
         added_edges: list[torch.Tensor] = []
@@ -299,49 +701,168 @@ class RoadNetwork:
         touched_edges: set[int] = set()
         removed: set[int] = set()
         snap_updates: dict[int, tuple[int, int]] = {}
+        width_updates: dict[int, float] = {}
         n_alive = len(self.edges)
 
         for i in order:
             spec = rewrites[i]
             if isinstance(spec, RoadRewriteAdd):
+                if node_status.get(spec.from_node) == "orphaned":
+                    continue  # このバッチ内の他の変更(Merge/Remove)で from_node が孤立する予定
                 added_nodes.append(torch.tensor([[spec.x, spec.y]], dtype=dtype, device=device))
                 added_edges.append(torch.tensor([[spec.from_node, n_next]], dtype=torch.long, device=device))
                 added_widths.append(torch.tensor([spec.width], dtype=dtype, device=device))
+                live_edges[next_edge_id] = (spec.from_node, n_next, spec.width)
+                next_edge_id += 1
                 n_next += 1
-            elif isinstance(spec, RoadRewriteAddFree):
-                added_nodes.append(torch.tensor([[spec.x1, spec.y1], [spec.x2, spec.y2]], dtype=dtype, device=device))
-                added_edges.append(torch.tensor([[n_next, n_next + 1]], dtype=torch.long, device=device))
-                added_widths.append(torch.tensor([spec.width], dtype=dtype, device=device))
-                n_next += 2
+                node_status.setdefault(spec.from_node, "attached")
+            elif isinstance(spec, RoadRewriteAddAnywhere):
+                if node_status.get(spec.from_node) == "orphaned":
+                    continue
+                k = len(spec.pts)
+                added_nodes.append(torch.tensor(list(spec.pts), dtype=dtype, device=device))
+                starts = torch.tensor(
+                    [spec.from_node] + list(range(n_next, n_next + k - 1)), dtype=torch.long, device=device
+                )
+                ends = torch.arange(n_next, n_next + k, dtype=torch.long, device=device)
+                added_edges.append(torch.stack([starts, ends], dim=-1))
+                added_widths.append(torch.full((k,), spec.width, dtype=dtype, device=device))
+                for s, e in zip(starts.tolist(), ends.tolist()):
+                    live_edges[next_edge_id] = (s, e, spec.width)
+                    next_edge_id += 1
+                n_next += k
+                node_status.setdefault(spec.from_node, "attached")
             elif isinstance(spec, RoadRewriteRemove):
-                if spec.edge_id in touched_edges or n_alive <= 1:
+                if spec.edge_id in touched_edges or spec.edge_id not in live_edges or n_alive <= 1:
+                    continue
+                a, b, _ = live_edges[spec.edge_id]
+                leaf = a if base_degree[a] == 1 else b
+                if node_status.get(leaf) is not None:
+                    continue  # このバッチ内の他の変更(Add/AddAnywhere/Snap)で leaf に新しい枝が付いた
+                touched_edges.add(spec.edge_id)
+                removed.add(spec.edge_id)
+                del live_edges[spec.edge_id]
+                n_alive -= 1
+                node_status[leaf] = "orphaned"
+            elif isinstance(spec, RoadRewriteSplit):
+                if spec.edge_id in touched_edges or spec.edge_id not in live_edges:
                     continue
                 touched_edges.add(spec.edge_id)
                 removed.add(spec.edge_id)
-                n_alive -= 1
-            elif isinstance(spec, RoadRewriteSnap):
-                if spec.edge_id in touched_edges:
+                a, b, w = live_edges.pop(spec.edge_id)
+                added_nodes.append(torch.tensor([[spec.x, spec.y]], dtype=dtype, device=device))
+                added_edges.append(torch.tensor([[a, n_next], [n_next, b]], dtype=torch.long, device=device))
+                added_widths.append(torch.tensor([w, w], dtype=dtype, device=device))
+                live_edges[next_edge_id] = (a, n_next, w)
+                live_edges[next_edge_id + 1] = (n_next, b, w)
+                next_edge_id += 2
+                n_next += 1
+                n_alive += 1
+            elif isinstance(spec, RoadRewriteMerge):
+                if (
+                    spec.edge_id_a in touched_edges
+                    or spec.edge_id_b in touched_edges
+                    or node_status.get(spec.node_id) is not None
+                    or spec.edge_id_a not in live_edges
+                    or spec.edge_id_b not in live_edges
+                ):
                     continue
+                touched_edges.add(spec.edge_id_a)
+                touched_edges.add(spec.edge_id_b)
+                removed.add(spec.edge_id_a)
+                removed.add(spec.edge_id_b)
+                del live_edges[spec.edge_id_a]
+                del live_edges[spec.edge_id_b]
+                added_edges.append(torch.tensor([[spec.outer_a, spec.outer_b]], dtype=torch.long, device=device))
+                added_widths.append(torch.tensor([spec.width], dtype=dtype, device=device))
+                live_edges[next_edge_id] = (spec.outer_a, spec.outer_b, spec.width)
+                next_edge_id += 1
+                n_alive -= 1
+                node_status[spec.node_id] = "orphaned"
+            elif isinstance(spec, RoadRewriteSnap):
+                if spec.edge_id in touched_edges or spec.edge_id not in live_edges:
+                    continue
+                if node_status.get(spec.target_node) == "orphaned":
+                    continue  # このバッチ内の他の変更(Merge/Remove)で target_node が孤立する予定
+                a, b, w = live_edges[spec.edge_id]
+                # Snap は「ぶら下がった端点(=このエッジのみを持つ次数1のノード)」を target_node へ
+                # 付け替える操作。付け替え元の端点はこのエッジしか持たないため、付け替えると孤立する
+                # (Removeの葉ノードと同じ扱いが必要)
+                dangling = a if spec.end == 0 else b
+                if node_status.get(dangling) is not None:
+                    continue  # このバッチ内の他の変更(Add/AddAnywhere/Snap)で付け替え元に新しい枝が付いた
+                if max_width is not None and w >= max_width - 1e-9:
+                    target_has_hw = any(
+                        ww >= max_width - 1e-9 and (aa == spec.target_node or bb == spec.target_node)
+                        for aa, bb, ww in live_edges.values()
+                    )
+                    if not target_has_hw:
+                        continue  # このバッチ内の他の変更でtargetがhighway適格でなくなった(不変条件B)
                 touched_edges.add(spec.edge_id)
+                if spec.end == 0:
+                    live_edges[spec.edge_id] = (spec.target_node, b, w)
+                else:
+                    live_edges[spec.edge_id] = (a, spec.target_node, w)
                 snap_updates[spec.edge_id] = (spec.end, spec.target_node)
+                node_status[dangling] = "orphaned"
+                node_status.setdefault(spec.target_node, "attached")
+            elif isinstance(spec, RoadRewriteUnsnap):
+                if spec.edge_id in touched_edges or spec.edge_id not in live_edges:
+                    continue
+                a, b, w = live_edges[spec.edge_id]
+                old_node = a if spec.end == 0 else b
+                other = b if spec.end == 0 else a
+                is_hw = max_width is not None and w >= max_width - 1e-9
+                if not _reachable(spec.edge_id, old_node, other) or (
+                    is_hw and not _reachable(spec.edge_id, old_node, other, highway_only=True)
+                ):
+                    continue  # このバッチ内の他の変更と合わせるとブリッジになってしまう(不変条件A/B)
+                touched_edges.add(spec.edge_id)
+                if spec.end == 0:
+                    live_edges[spec.edge_id] = (n_next, b, w)
+                else:
+                    live_edges[spec.edge_id] = (a, n_next, w)
+                added_nodes.append(self.nodes[old_node : old_node + 1].detach().clone())
+                snap_updates[spec.edge_id] = (spec.end, n_next)
+                n_next += 1
+            elif isinstance(spec, (RoadRewriteWiden, RoadRewriteNarrow)):
+                if spec.edge_id in touched_edges or spec.edge_id not in live_edges:
+                    continue
+                a, b, w = live_edges[spec.edge_id]
+                if max_width is not None:
+                    if isinstance(spec, RoadRewriteWiden) and spec.new_width >= max_width - 1e-9:
+                        has_hw_neighbor = any(
+                            eid2 != spec.edge_id and ww >= max_width - 1e-9 and (a in (aa, bb) or b in (aa, bb))
+                            for eid2, (aa, bb, ww) in live_edges.items()
+                        )
+                        if not has_hw_neighbor:
+                            continue  # このバッチ内の他の変更でhighwayに接していなくなった(不変条件B)
+                    if isinstance(spec, RoadRewriteNarrow) and w >= max_width - 1e-9:
+                        if not _reachable(spec.edge_id, a, b, highway_only=True):
+                            continue  # highwayサブグラフのブリッジ辺。格下げすると分断される(不変条件B)
+                touched_edges.add(spec.edge_id)
+                live_edges[spec.edge_id] = (a, b, spec.new_width)
+                width_updates[spec.edge_id] = spec.new_width
             else:
                 raise ValueError(f"Unknown rewrite {spec}")
 
         edges = self.edges.clone()
+        widths = self.widths.clone()
         for eid, (end, target) in snap_updates.items():
             edges[eid, end] = target
+        for eid, w in width_updates.items():
+            widths[eid] = w
         if removed:
             keep = torch.ones(len(edges), dtype=torch.bool, device=device)
             for eid in removed:
                 keep[eid] = False
             edges = edges[keep]
-            widths = self.widths[keep]
-        else:
-            widths = self.widths.clone()
+            widths = widths[keep]
         nodes = self.nodes.detach().clone()
 
         if added_nodes:
             nodes = torch.cat([nodes, *added_nodes], dim=0)
+        if added_edges:
             edges = torch.cat([edges, *added_edges], dim=0)
             widths = torch.cat([widths, *added_widths], dim=0)
 
@@ -356,14 +877,14 @@ class RoadNetwork:
 @dataclass
 class RoadCollectionArgs:
     sigma0: float = 0.03  # street相当の最小到達半径
-    k_sigma: float = 1.0  # 幅 -> 到達半径の係数（幅が太いほど広く効く）
+    k_sigma: float = 1.0  # 幅 -> 到達半径の係数(幅が太いほど広く効く)
     reach_exponent: float = 1.0  # sigma_e = sigma0 + k_sigma * w_e^reach_exponent。1より大きいほど
     # 幅の広い道路(幹線道路)の到達半径だけが不釣り合いに拡大し、幅の狭い道路(街路)はsigma0付近に留まる。
     amp_scale: float = 0.05  # ピーク強度 = amp_scale / sigma_e (<=1)。sigma(=到達半径)が広いほどピークが下がる
     # amp_scale と sigma_e から決まるピーク強度により、幹線道路(幅広->sigma大)は「薄く広く」、
     # 街路(幅狭->sigma小)は「狭く大きく」効くようにする(断面積 amplitude*sigma がほぼ一定になる)。
-    min_density_floor: float = 0.15  # 人口密度の最低ライン。道路の有無によらず無条件で保証する（max で合成）。
-    # 損失側の非対称罰則（下回った分だけ罰する）にすると、道路を敷かなければ床を満たせない場所では
+    min_density_floor: float = 0.15  # 人口密度の最低ライン。道路の有無によらず無条件で保証する(max で合成)。
+    # 損失側の非対称罰則(下回った分だけ罰する)にすると、道路を敷かなければ床を満たせない場所では
     # 罰則を払うだけで済んでしまい「保証」にならない。無条件の下駄にすることで確実に保証する。
 
 
@@ -530,7 +1051,7 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
     def rasterize(self, positions: torch.Tensor) -> torch.Tensor:
         """
         positions: (*shape, 2)
-        returns: (n_networks, *shape) 各ネットワークのSDF（境界判定・可視化用。損失には compute_density を使う）
+        returns: (n_networks, *shape) 各ネットワークのSDF(境界判定・可視化用。損失には compute_density を使う)
         """
         *shape, _ = positions.shape
         p0 = self.nodes[self.edges[:, 0]]
@@ -551,14 +1072,6 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
         c_e(x)      = amplitude_e * exp(-(relu(sdf_e(x)) / sigma_e)^2)
         raw(x)      = max_e c_e(x)                             # 重ね合わせではなく最大値を採用
         density(x)  = max(raw(x), min_density_floor)           # 最低ラインを無条件で保証する
-
-        「最大値」にしているのは、近くに幹線道路と街路があるとき、距離が近いというだけで幹線道路を
-        優先させず、実際の寄与(c_e)が大きい方（＝街路の方が寄与が強ければ街路）を採用するため。
-        幹線道路(幅広->sigma大->amplitude小)は「薄く広く」、街路(幅狭->sigma小->amplitude大)は
-        「狭く大きく」効くようになる。
-
-        最低ラインは道路の有無によらず無条件で保証する(道路が無い場所では損失側の罰則を払うだけで
-        済んでしまい「保証」にならないため)。
 
         returns: (n_networks, size, size)
         """
@@ -588,7 +1101,7 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
 
     def get_construction_costs(self, width_exponent: float = 1.0) -> torch.Tensor:
         """
-        長さ×幅^width_exponent の総和（建設コスト相当）をネットワークごとに集計する。
+        長さ×幅^width_exponent の総和(建設コスト相当)をネットワークごとに集計する。
         width_exponent > 1 にすると、幅の広い道路(幹線道路)への罰則が幅に対して超線形に強くなる。
         """
         p0 = self.nodes[self.edges[:, 0]]
@@ -611,8 +1124,8 @@ class RoadNetworkCollection(ObjectCollection[RoadNetwork]):
 
     def get_meshedness(self) -> torch.Tensor:
         """
-        道路網のループ(閉路)の多さを 0〜1 程度で表す指標（meshedness / alpha index）。
-        cycles = max(E - V + 1, 0)          # 閉路数（連結成分が1つの場合は厳密。複数ある場合は下限値）
+        道路網のループ(閉路)の多さを 0〜1 程度で表す指標(meshedness / alpha index)。
+        cycles = max(E - V + 1, 0)          # 閉路数(連結成分が1つの場合は厳密。複数ある場合は下限値)
         meshedness = cycles / max(2V - 5, 1)  # 平面グラフが取りうる最大閉路数に対する比
 
         V は孤立ノード(次数0。Remove直後などでまだ prune されていないもの)を除いた実際に

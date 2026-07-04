@@ -270,3 +270,80 @@ def visualize(self, collection: ObjectCollection[RoadNetwork], step: int, loss: 
 4. `Snap` 書き換え（一様グリッド探索）を追加してループ形成を確認
 5. 幅クラスを複数に増やし、Add提案の複製ロジックを確認
 6. `cost_weight` 等のハイパーパラメータ調整、実データ（人口密度マップ）でのテスト
+
+## 9. 文法の根本再設計：4つの性質（Reversibility / Jump Continuity / Local Geometric Control / Repairability）に基づく（2026-07-04）
+
+### 9.0 動機
+
+実データでの学習結果を見ると、(a) 道路網が複数の非連結な部分に分かれる、(b) 幹線道路が街路に完全に囲まれて孤立している（幹線道路網としての連続性がない）、という2つの「都市として不自然」な問題が見えた。これらは損失関数の重み付け（meshedness報酬・角度罰則など）をいくら足しても**確率的にしか抑制できず、構造として禁止できない**。論文 (`design-for-descent.pdf`) が提示する4つの性質（Table 1）に立ち返り、**連結性・幹線道路の階層性を"損失"ではなく"文法の構造的な不変条件"として保証する**方向に文法自体を再設計する。
+
+論文の4性質（Table 1 の定義そのまま）:
+
+| 性質 | 定義 | 論文中の例 |
+|---|---|---|
+| **Reversibility** | 書き換え `A→B` があるなら、逆方向 `B→A` も存在すること | Split/Merge、Add/Remove-Loop |
+| **Jump Continuity** | 書き換えの適用による形状の瞬間的な変化が無視できるほど小さいこと | 局所的なセグメント分割 |
+| **Local Geometric Control** | 形状のどこにでも、遠方に影響を与えずに局所的な変更を加える書き換えが存在すること | Add-Anywhere |
+| **Repairability** | 制約が存在するなら、それに違反した形状を修復する書き換えが存在すること | Resolve-Intersections |
+
+Tree文法（`objects/tree.py`）は上記をすでに満たす実例になっている: `SplitBranch`↔（分割自体は`Merge`相当の操作は無いが可逆な`RemoveBranch`と対）、`AddBranch`（epsilon長で追加=Jump Continuity）↔`RemoveBranch`、`AddAnywhere`（**遠方の任意の点へ、既存ノードから新規ノードの鎖で"必ず接続したまま"到達する** = Local Geometric Control）、`cleanup()`（交差する枝を検出し`SplitBranch`で再接続する = Repairability、制約は「枝同士が交差しない」）。今回の道路網再設計は、この Tree の設計パターンをグラフ表現に翻訳する。
+
+### 9.1 構造的な不変条件（損失ではなく書き換えの前提条件として保証する）
+
+現行文法の `AddFree`（空間中に孤立した新規道路を置く）が非連結性の直接の原因。これを**廃止**し、代わりに次の2つの不変条件を、全ての書き換えの生成条件（`gen_rewrite_specs` の候補列挙時）でチェックすることによって常に保証する:
+
+- **不変条件A（連結性）**: ネットワークは常に単一の連結成分である。初期化時は単一エッジのみなので自明に満たされる。以降、ノード・エッジを追加する書き換えは必ず既存ノードから辿れる形でのみ行う（`AddFree` 相当の操作を削除し、後述 `AddAnywhere` に置き換える）。ノード・エッジを削除する書き換えは、削除後も連結性が保たれる場合のみ候補に含める。
+- **不変条件B（幹線道路の階層性）**: `width_classes` の中で最も太いクラス（highway）が張るサブグラフ（highwayエッジのみを辺とする部分グラフ）は常に単一連結成分であり、かつ初期化時のルートノードを含む。つまり **highwayエッジは、既にhighwayエッジに触れているノード（またはルート）からしか新規に生えない**。street は highway ノード・street ノードのどちらからでも自由に生える（現実の都市同様、幹線道路の途中から街路が分岐するのは自然）。この条件により「幹線道路が街路network経由でしか本体に繋がっていない」という孤立が構造的に発生しなくなる。
+
+これらは `compute_simplicity`/`_compute_losses` の罰則ではなく、**そもそもそのような書き換え提案を生成しない**という形で保証する（生成されなければ`combine_proposals`が選びようがない）。
+
+### 9.2 書き換えセットの再設計
+
+| 書き換え | 内容 | 逆操作 | 満たす性質 |
+|---|---|---|---|
+| `Add(node_id, width_class)` | 既存ノードから epsilon 長の新規エッジを伸ばす（末端ノード新設）。`width_class=highway` の場合は `node_id` が不変条件Bの意味でhighway適格（隣接エッジに1本以上highwayがある、またはルート）であることが必須 | `Remove` | Jump Continuity（epsilon長）／Reversibility |
+| `Remove(edge_id)` | 次数1（末端）のエッジを削除。末端なので常に安全（連結性を壊さない） | `Add` | Reversibility |
+| `AddAnywhere(target_point, width_class)` | 空間中の任意の点へ向け、**最も近い適格な既存ノードから新規ノードの鎖（1本以上）で接続したまま**到達する（`Tree.AddAnywhere`と同型のアルゴリズム）。`width_class=highway`の場合は起点ノードが不変条件Bのhighway適格ノードに制限される | 鎖の末端から`Remove`を繰り返す | **Local Geometric Control**（遠方への局所変更）／Reversibility |
+| `Split(edge_id, t)` | エッジをパラメータ `t∈(0,1)` の位置で分割し、同じ`width_class`の2本の新エッジ＋次数2の新規ノードにする。位置は分割前と完全に一致するため形状は変化しない | `Merge` | **Jump Continuity**（論文の例そのもの：局所的なセグメント分割）／Reversibility |
+| `Merge(node_id)` | 次数2のノードで、両側のエッジの `width_class` が同じかつほぼ共線（角度ずれ`< eps`、`ArcLines`の`ToLine`/`Merge`と同じ厳密性のゲート）の場合にノードを消して1本のエッジに統合 | `Split` | Reversibility（`eps`ゲートによりJump Continuityも保つ） |
+| `Snap(edge_id, target_node_id)` | ぶら下がった端点を既存ノードに張り替えてループ/交差点を作る。`width_class=highway`のエッジは、張り替え先もhighway適格ノードに制限（不変条件B維持） | `Unsnap` | Reversibility（論文の Add/Remove-Loop 例） |
+| `Unsnap(edge_id)` | サイクル上のエッジ（=削除しても連結性を壊さないエッジ）を選び、片方の端点を**同じ座標に新規複製したノード**に付け替え、ぶら下がった端点に戻す（形状は瞬間的に不変）。highwayエッジの場合は「highwayサブグラフだけを見ても連結性が壊れない」ことも追加で確認（不変条件B維持） | `Snap` | Reversibility／Jump Continuity（同座標に複製するため見た目は変わらない） |
+| `Widen(edge_id)` | street→highway への格上げ。両端点それぞれについて「このエッジを除いた残りの隣接エッジが全てhighway、または次数1（=このエッジのみ）」を満たす場合のみ許可（格上げが不変条件Bを壊さない場合のみ） | `Narrow` | Reversibility |
+| `Narrow(edge_id)` | highway→street への格下げ。street は制約が無いので常に許可 | `Widen` | Reversibility |
+
+**削除する操作**: `AddFree`（不変条件Aに反するため廃止。役割は `AddAnywhere` が代替）。
+
+### 9.3 Repairability：交差の解消
+
+不変条件A・Bは書き換えの生成条件で保証されるため、通常はこれらに関する「修復」は不要になる（違反する形状がそもそも生成されない）。一方、**勾配降下によるノード位置の連続的な移動**は書き換えとは独立に起こるため、位置更新の結果、共有ノードを持たない2本のエッジが幾何的に交差してしまう（本来は交差点＝共有ノードであるべき）ケースが起こりうる。これは道路網特有の制約（「交差する道路は必ずノードを共有する」）であり、論文の Repairability の直接的な適用対象になる。
+
+`Tree.cleanup()` が行っている「交差するエッジを検出し `SplitBranch` で分割・再接続する」アルゴリズムをグラフ表現に翻訳し、`RoadNetwork` にも `cleanup()`（または `resolve_crossings()`）として実装する。具体的には、交差する2エッジそれぞれを交点で `Split` し、生成された2つの新規ノードを1つに統合する（`Merge`とは異なり幅クラスが異なっていても統合可能な特別処理、または単純に一方のノードへ他方のエッジを張り替える）。`optimizer.py` が定期的に呼ぶ `Task.cleanup()` から呼び出す（既存の `prune_orphan_nodes()` 呼び出しと同じ場所）。
+
+### 9.4 現行実装からの変更点まとめ
+
+- `RoadRewriteType` から `AddFree` を削除し、`AddAnywhere`（Tree型の鎖接続）に置き換える
+- `RoadRewriteType` に `Split` / `Merge` / `Unsnap` / `Widen` / `Narrow` を追加
+- 各書き換えの候補生成（`gen_rewrite_specs`）に、不変条件A（連結性）・不変条件B（highway階層性）のチェックを追加する。特に「ノードがhighway適格か」の判定（隣接エッジ集合から計算）はほぼ全ての書き換えで共通して必要になるため、共通ヘルパー（例: `RoadNetwork.is_highway_eligible(node_id)`）として実装する
+- `Unsnap` の「削除しても（highwayサブグラフに限定しても）連結性を壊さないエッジか」の判定は、ネットワーク全体では稀にしか呼ばれない想定なので、候補ごとに小規模なBFS（対象ノードから、削除対象エッジを除いたグラフで到達可能か）で十分。全体を都度再計算するのではなく、Snap候補と同様に「ローカルな判定」として実装する
+- `RoadNetwork.cleanup()`（交差解消、9.3節）を新設し、`RoadTask.cleanup()` から `prune_orphan_nodes()` と並べて呼び出す
+- meshedness報酬（4.1節）・角度罰則（4.2節）・建設コスト（4節）は引き続き損失/simplicityとして残す——これらは「あった方が良い」性質（都市らしい見た目のスコア）であり、連結性・階層性のような「あってはならない違反」とは性質が異なるため、両者は併用する
+
+### 9.5 未確定・実装時に判断が必要な点
+
+- `AddAnywhere` のデフォルト `width_class` は street とする想定（Parish & Müller の「streetがhighway間を埋める」という役割分担に合わせる）。highway の `AddAnywhere` も許可するかは、実験して都市らしさを見ながら判断する
+- `Unsnap` のBFSコストが大きい場合は、`get_meshedness()` と同様に「近似で十分」という割り切り（例えば次数3以上のノードに接続するエッジのみを候補にする、など）も検討する
+- `Widen`/`Narrow` は今回のユーザー要望（連結性・階層性）に必須ではないが、Reversibilityの観点で「幅クラスを変える書き換えが存在するなら逆方向も必要」という論文の原則に従うために追加を提案している。優先度を下げて後回しにする選択肢もある
+
+### 9.6 実装完了（2026-07-04）
+
+9節の設計に基づき `objects/roads.py`/`tasks/roads.py` を全面的に書き直した（既存ファイルの新規置き換え。他の既存コードは変更なし）。目的関数（3〜4節）は変更せず、書き換え（rewrite）の生成条件・適用ロジックのみを再設計した。
+
+**実装した書き換え**: `Add`/`Remove`/`AddAnywhere`/`Split`/`Merge`/`Snap`/`Unsnap`/`Widen`/`Narrow`（9.2節の表のとおり）。`AddFree` は完全に削除。
+
+**テストで発見・修正した設計上のバグ**（いずれも「単体では安全な書き換えが、同じ最適化ステップ内で複数同時に採択されると組み合わせで不変条件を破る」というクラスの問題。`RoadTask.combine_proposals` は複数の改善提案を1ステップでまとめて採択する（`accept_parallel`）ため、この検証が必須だった）：
+
+1. **Narrow がhighwayサブグラフのブリッジ辺を切ってしまう**: 最後の1本かどうかだけをチェックしていたが、highwayが木構造（枝分かれ）になっている場合、中間の辺を格下げするとhighway網が2つに分断される。`_is_reachable_without_edge`（highway限定BFS）によるブリッジ判定を追加して修正
+2. **`apply_all_rewrites` 内での「孤立化 vs 接続」の競合**: `Merge`/`Remove`/`Snap`はいずれも対象ノードの一方を孤立させる（または孤立していたノードを消費する）操作だが、同じバッチ内で別の`Add`/`AddAnywhere`/`Snap`がその"孤立する側"に新しい枝を接続していると、その枝ごと本体から切り離されてしまう。`node_status`（ノードごとの"orphaned"/"attached"状態）辞書を追加し、孤立操作と接続操作が同じノードで競合したら後勝ちを拒否するよう修正
+3. **同一バッチ内の複数`Unsnap`が同じループを共有する場合**: 1本目のUnsnapでループが開いた後は残りの辺がブリッジになるため、2本目以降のUnsnapは無効化する必要がある。`apply_all_rewrites`内で`live_edges`という軽量な辞書ベースのグラフ状態を保持し、Unsnap/Narrowの安全性チェックを「バッチ開始時点」ではなく「その時点までに確定した変更を反映した最新状態」に対して行うことで解決
+
+**検証方法**: 通常の単体テスト（不変条件の生成条件チェック、バッチ版`make_proposals_ex`と単体版`apply_rewrite`のクロスチェック）に加えて、`apply_all_rewrites`にランダムな提案の部分集合（最大25件）を繰り返し適用し、毎ステップ後に「全体の連結性」「highwayサブグラフの連結性・非空性」を検査するfuzzテストを実装（スクラッチパッドのみ、リポジトリには含めていない）。30種のランダムシードで400ステップ、7種で1200ステップ（ネットワークが350〜420ノードまで成長）、いずれも違反なしを確認。実際の`scripts/optimize_pngs.py`経由のCLI実行（`_rungen_roads_pngs.py`が生成するコマンド）でも動作確認済み。
