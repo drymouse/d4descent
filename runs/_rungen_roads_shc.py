@@ -31,8 +31,12 @@ def main():
     b.add("--task.rewrite_args.width_classes", [0.02, 0.05])
     b.add("--task.rewrite_args.length_range", [0.05, 0.15])
     b.add("--task.rewrite_args.snap_radius", 0.05)
-    b.add("--task.rewrite_args.add_weight", 3.0)  # 先端から伸ばす確率を上げる
-    b.add("--task.rewrite_args.add_anywhere_weight", 0.15)  # 遠方への鎖接続(旧AddFree)の確率を下げる
+    b.add("--task.rewrite_args.add_weight", 3.0)  # 先端から伸ばす候補を多めに生成する
+    # AddAnywhere は連結を保ったまま遠方(ターゲット密度の高い領域)へ道路を広げる唯一の手段。
+    # 層化サンプリングにより提案予算は各書き換えタイプへ公平に配分されるので、ここでは候補の
+    # 多様性(狙う点の数)を確保するために weight を1.0にする（0.15だと候補が枯れて spreading が停滞した）。
+    b.add("--task.rewrite_args.add_anywhere_weight", 1.0)
+    b.add("--task.rewrite_args.n_add_anywhere_candidates", 32)
     # optim
     b.add("--optim.proposal_trigger", "step")
     b.add("--optim.propose_every", 25)

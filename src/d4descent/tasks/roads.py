@@ -102,12 +102,50 @@ class RoadTask(Task[RoadNetwork, RoadRewrite, StateT]):
     def make_proposals(self, obj: RoadNetwork) -> tuple[ObjectCollection[RoadNetwork], list[RoadRewrite]]:
         raise NotImplementedError("use make_proposals_ex")
 
+    def get_add_anywhere_targets(self) -> Optional[torch.Tensor]:
+        """AddAnywhere が狙う候補点プール。基底クラスでは None(lim 全体から一様サンプル)。
+        RoadDensityTask がターゲット人口密度に偏らせた点を返す。"""
+        return None
+
+    def _stratified_sample(self, specs: list[RoadRewrite], num_proposals: int) -> list[RoadRewrite]:
+        """
+        提案を書き換えタイプごとにグループ化し、num_proposals の予算をタイプ間で公平に配分して
+        サンプルする。単純な一様サンプルだと候補数の多いタイプ(Add)が予算を独占し、spreading の
+        唯一の手段である AddAnywhere などの少数タイプが評価対象から漏れてしまうため。
+
+        ラウンドロビン方式: 各タイプの候補をシャッフルしておき、タイプを順に回りながら1個ずつ
+        取っていく。空になったタイプは飛ばす。これにより少数タイプも必ず代表されつつ、
+        余った予算は候補の多いタイプが自然に埋める。
+        """
+        if num_proposals <= 0 or len(specs) <= num_proposals:
+            return specs
+        groups: dict[type, list[RoadRewrite]] = {}
+        for s in specs:
+            groups.setdefault(type(s), []).append(s)
+        for pool in groups.values():
+            random.shuffle(pool)
+        types = list(groups.keys())
+        random.shuffle(types)
+        chosen: list[RoadRewrite] = []
+        while len(chosen) < num_proposals:
+            progressed = False
+            for t in types:
+                if groups[t]:
+                    chosen.append(groups[t].pop())
+                    progressed = True
+                    if len(chosen) >= num_proposals:
+                        break
+            if not progressed:
+                break
+        return chosen
+
     def make_proposals_ex(
         self, obj: RoadNetwork, num_proposals: int
     ) -> tuple[ObjectCollection[RoadNetwork], list[RoadRewrite]]:
-        specs = obj.gen_rewrite_specs(self.args.rewrite_args, lim=self.render_args.lim)
-        if num_proposals > 0 and len(specs) > num_proposals:
-            specs = random.sample(specs, num_proposals)
+        specs = obj.gen_rewrite_specs(
+            self.args.rewrite_args, lim=self.render_args.lim, add_anywhere_targets=self.get_add_anywhere_targets()
+        )
+        specs = self._stratified_sample(specs, num_proposals)
 
         device = obj.nodes.device
         dtype = obj.nodes.dtype
@@ -405,6 +443,33 @@ class RoadDensityTask(RoadTask[None]):
         # target_img(pngs/shcどちらの入力元でも)を target_inside_value/target_outside_value の範囲へ
         # アフィン変換する。以降はこの変換済みの値を target として扱う。
         self.target_img = args.target_outside_value + (args.target_inside_value - args.target_outside_value) * target_img
+        self._add_anywhere_targets = self._precompute_add_anywhere_targets(target_img)
+
+    def _precompute_add_anywhere_targets(self, target_img_raw: torch.Tensor, n_points: int = 4096) -> torch.Tensor:
+        """
+        AddAnywhere が狙う候補点を、元の target_img(高いほど市街地)に比例した確率で事前サンプルする。
+        こうすることで spreading の提案が背景ではなく人口密度の高い領域を狙うようになる
+        (従来は lim 全体から一様サンプルしており、Donut等では約8割が無意味な背景を狙っていた)。
+        """
+        size = self.render_args.size
+        lim0, lim1 = self.render_args.lim
+        probs = target_img_raw.flatten().clamp(min=0).float()
+        if float(probs.sum()) <= 0:
+            probs = torch.ones_like(probs)
+        probs = probs / probs.sum()
+        idx = torch.multinomial(probs, num_samples=n_points, replacement=True)
+        rows = (idx // size).float()  # y方向(compute_densityのgridと同じ規約: 行=y, 列=x)
+        cols = (idx % size).float()  # x方向
+        if self.render_args.center_pixel:
+            px = (cols + 0.5) / size * (lim1 - lim0) + lim0
+            py = (rows + 0.5) / size * (lim1 - lim0) + lim0
+        else:
+            px = cols / (size - 1) * (lim1 - lim0) + lim0
+            py = rows / (size - 1) * (lim1 - lim0) + lim0
+        return torch.stack([px, py], dim=-1).cpu()  # (n_points, 2)
+
+    def get_add_anywhere_targets(self) -> Optional[torch.Tensor]:
+        return self._add_anywhere_targets
 
     def initialize_state(self) -> None:
         return None

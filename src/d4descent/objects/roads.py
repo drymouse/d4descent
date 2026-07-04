@@ -151,9 +151,10 @@ class RoadRewriteArgs:
     width_classes: tuple[float, ...] = (0.02, 0.05)  # 昇順。最後の要素をhighway(幹線道路)とみなす
     length_range: tuple[float, float] = (0.05, 0.15)
     n_add_candidates: int = 32
-    n_add_anywhere_candidates: int = 8
+    n_add_anywhere_candidates: int = 32
     n_split_candidates: int = 16
     snap_radius: float = 0.05
+    max_add_anywhere_hops: int = 6  # AddAnywhereの鎖の最大エッジ数。背景を貫く長大な橋を1提案で作らせない
     merge_angle_eps: float = math.radians(5.0)  # 反対方向(=直線)からのずれがこれ以内ならMerge可
     unsnap_bfs_budget: int = 256  # Unsnap候補の連結性チェック(BFS)で訪問するノード数の上限
     add_weight: float = 1.0
@@ -386,7 +387,17 @@ class RoadNetwork:
             )
         return net
 
-    def gen_rewrite_specs(self, args: RoadRewriteArgs, lim: tuple[float, float]) -> list[RoadRewrite]:
+    def gen_rewrite_specs(
+        self,
+        args: RoadRewriteArgs,
+        lim: tuple[float, float],
+        add_anywhere_targets: Optional[torch.Tensor] = None,
+    ) -> list[RoadRewrite]:
+        """
+        add_anywhere_targets: (M, 2) の候補点プール。渡された場合、AddAnywhere はこの中から
+        ランダムに狙う点を選ぶ(ターゲット人口密度の高い領域に偏らせるために Task 側が渡す)。
+        None の場合は lim 全体から一様サンプルする(従来動作)。
+        """
         device = self.nodes.device
         n_nodes = len(self.nodes)
         n_edges = len(self.edges)
@@ -431,15 +442,21 @@ class RoadNetwork:
                         continue  # 不変条件B
                     specs.append(RoadRewriteAdd(from_node=ni, x=x1, y=y1, width=w))
 
-        # ---- AddAnywhere: 遠方の任意の点へ、最も近い適格ノードから鎖で繋がったまま到達する ----
+        # ---- AddAnywhere: ターゲット領域内の点へ、最も近い適格ノードから鎖で繋がったまま到達する ----
         # (Local Geometric Control。不変条件Aを満たすため、AddFreeの代替として孤立配置は行わない)
+        # add_anywhere_targets が渡されればそこから狙う点を選ぶ(人口密度の高い領域に偏らせる)。
+        # spreading の唯一の手段なので、狙う点を有効領域に集中させることが収束に効く。
         if args.add_anywhere_weight > 0 and live_nodes:
             n_cand = max(round(args.n_add_anywhere_candidates * args.add_anywhere_weight), 1)
             lim0, lim1 = lim
             max_len = args.length_range[1]
             for _ in range(n_cand):
-                tx = random.uniform(lim0, lim1)
-                ty = random.uniform(lim0, lim1)
+                if add_anywhere_targets is not None and len(add_anywhere_targets) > 0:
+                    ti = random.randrange(len(add_anywhere_targets))
+                    tx, ty = add_anywhere_targets[ti].tolist()
+                else:
+                    tx = random.uniform(lim0, lim1)
+                    ty = random.uniform(lim0, lim1)
                 target = torch.tensor([tx, ty])
                 for w in args.width_classes:
                     is_hw = w >= max_width - 1e-9
@@ -454,9 +471,14 @@ class RoadNetwork:
                     if dist < 1e-6:
                         continue
                     x0, y0 = pos[from_node].tolist()
+                    # 鎖の長さ(hop数)に上限を設ける。上限を超える遠方点へは、その方向へ max_hops 分だけ
+                    # 伸ばす(背景を貫く長大な橋を1提案で作らない。連結を保ったまま徐々に伸ばす)。
                     n_hops = max(1, math.ceil(dist / max_len))
+                    n_hops = min(n_hops, args.max_add_anywhere_hops)
+                    reach = min(1.0, n_hops * max_len / dist)  # 目標点まで届かない場合はその手前まで
+                    ex, ey = x0 + (tx - x0) * reach, y0 + (ty - y0) * reach
                     pts = tuple(
-                        (x0 + (tx - x0) * (k / n_hops), y0 + (ty - y0) * (k / n_hops)) for k in range(1, n_hops + 1)
+                        (x0 + (ex - x0) * (k / n_hops), y0 + (ey - y0) * (k / n_hops)) for k in range(1, n_hops + 1)
                     )
                     specs.append(RoadRewriteAddAnywhere(from_node=from_node, pts=pts, width=w))
 
