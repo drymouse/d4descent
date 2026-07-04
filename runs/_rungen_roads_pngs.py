@@ -24,6 +24,11 @@ def main():
     # (街路の散らかり・疎密の作り分けは街路コストではなく下の90度罰則が担う)。
     b.add("--task.size_width_exponent", 2.5)
     b.add("--task.mesh_weight", 0.05)  # ループ形成(meshedness)への報酬。都市らしい街区構造を促す
+    # cleanup で密集地帯の街路交差点を間引く。1セル(cell_size)にmax_per_cellを超える街路ノードが
+    # 集まったら1つに統合し、高密度域のスクリブル過密化を抑える(幹線・連結性は保持)。
+    b.add("--task.decimate_dense", True)
+    b.add("--task.decimate_cell_size", 0.06)
+    b.add("--task.decimate_max_per_cell", 2)
     # 90度交差の選好(原則3)。gapが90度格子{90,180,270}°からずれることを罰する。街路を直交・直進させ、
     # 低人口域への無秩序な蛇行も抑える(実験で街路の低人口域漏れ64%→11%、90度からのずれ37°→10°)。
     b.add("--task.angle_deadzone", math.radians(10))  # 格子まわりの許容幅(ラジアン)

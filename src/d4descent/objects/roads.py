@@ -339,11 +339,88 @@ class RoadNetwork:
         )
 
     @torch.no_grad()
-    def cleanup(self, max_iter: int = 4) -> "RoadNetwork":
+    def decimate_dense(self, cell_size: float, max_per_cell: int, highway_width: float) -> "RoadNetwork":
+        """
+        密集地帯を検出し、そこの街路ノード(交差点)と接続道路を間引く。
+        cell_size のグリッドに区切り、1セル内のノード数が max_per_cell を超える"密集セル"では、
+        そのセル内の街路ノード(幹線道路に接していないノード)を1つの代表ノードへ統合(collapse)する。
+        統合で生じた自己ループは除去、同一ノード対の重複エッジは幅最大(=幹線を優先)の1本に集約する。
+
+        - 連結性は保たれる: 統合はノードをまとめるだけで、外部への接続はすべて代表ノードへ移るため
+          非連結化しない(不変条件A)。
+        - 幹線道路ノード・エッジは一切触らない(remap対象外・自己ループ化しない)ので、幹線サブグラフの
+          連結性・非空性は完全に保持される(不変条件B)。
+
+        高密度域(人口密度が高く街路を密に敷く価値がある領域, 原則2)で街路がスクリブル状に過密化するのを、
+        「1セルあたり最大 max_per_cell ノード」の解像度に間引くことで、密ではあるが整然とした網に均す。
+        """
+        n_nodes = len(self.nodes)
+        if n_nodes == 0 or len(self.edges) == 0:
+            return self
+        device = self.nodes.device
+        pos = self.nodes.detach().cpu().tolist()
+        edges_list = self.edges.tolist()
+        widths_list = self.widths.tolist()
+
+        is_hw_edge = [w >= highway_width - 1e-9 for w in widths_list]
+        hw_incident = [False] * n_nodes
+        degree = [0] * n_nodes
+        for (a, b), hw in zip(edges_list, is_hw_edge):
+            degree[a] += 1
+            degree[b] += 1
+            if hw:
+                hw_incident[a] = True
+                hw_incident[b] = True
+
+        cell = max(cell_size, 1e-9)
+        buckets: dict[tuple[int, int], list[int]] = {}
+        for i, (x, y) in enumerate(pos):
+            buckets.setdefault((math.floor(x / cell), math.floor(y / cell)), []).append(i)
+
+        remap = list(range(n_nodes))
+        changed = False
+        for members in buckets.values():
+            if len(members) <= max_per_cell:
+                continue
+            # 代表ノード: 幹線道路に接するノードを優先し(街路をその交差点へ寄せる)、次に高次数を選ぶ
+            rep = max(members, key=lambda m: (hw_incident[m], degree[m]))
+            for m in members:
+                if m == rep or hw_incident[m]:
+                    continue  # 幹線ノードは統合しない(不変条件B)
+                remap[m] = rep
+                changed = True
+        if not changed:
+            return self
+
+        # remap 適用: 自己ループ除去 + 同一ノード対は幅最大の1本に集約
+        edge_w: dict[tuple[int, int], float] = {}
+        for (a, b), w in zip(edges_list, widths_list):
+            u, v = remap[a], remap[b]
+            if u == v:
+                continue
+            key = (u, v) if u < v else (v, u)
+            if key not in edge_w or w > edge_w[key]:
+                edge_w[key] = w
+        if not edge_w:
+            return self
+        new_edges = torch.tensor(list(edge_w.keys()), dtype=torch.long, device=device)
+        new_widths = torch.tensor(list(edge_w.values()), dtype=self.widths.dtype, device=device)
+        return RoadNetwork(
+            nodes=self.nodes, edges=new_edges, widths=new_widths, id=self.id, payload=self.payload
+        ).prune_orphan_nodes()
+
+    @torch.no_grad()
+    def cleanup(self, max_iter: int = 4, min_seg: float = 0.04, min_angle: float = math.radians(20.0)) -> "RoadNetwork":
         """
         共有ノードを持たずに幾何的に交差してしまった2辺(勾配降下でノード位置が動いた結果生じうる)
         を検出し、交点に新規ノードを1つ挿入して両辺をそこで分割する(Repairability、9.3節)。
         制約「交差する道路は必ずノードを共有する」に対する修復操作。
+
+        ただし高密度領域では街路が多数交差し、交差を分割するたびに短いエッジが増えて更に交差…と
+        断片化が暴走して中央がスクリブル状になる(実測で中央ノード密度が約2倍に膨らむ)。これを防ぐため
+        次の交差は解消しない(スリバーを作らない):
+        - 分割で生じる4本のサブセグメントのいずれかが min_seg 未満になる交差(端点近傍・微小な交差)
+        - 2辺の交差角が min_angle 未満の交差(ほぼ平行に重なっているだけ。真の交差点ではない)
         """
         net = self
         for _ in range(max_iter):
@@ -360,9 +437,26 @@ class RoadNetwork:
                     if len({a, b, c, d}) < 4:
                         continue  # ノードを共有している(隣接エッジ)ので交差ではない
                     hit, pt = _seg_intersect_2d(pos[a], pos[b], pos[c], pos[d])
-                    if hit:
-                        found = (i, j, pt)
-                        break
+                    if not hit:
+                        continue
+                    # ガード1: 分割で生じるサブセグメントが短すぎる交差はスリバーを生むので解消しない
+                    if min(
+                        (pos[a] - pt).norm().item(), (pos[b] - pt).norm().item(),
+                        (pos[c] - pt).norm().item(), (pos[d] - pt).norm().item(),
+                    ) < min_seg:
+                        continue
+                    # ガード2: ほぼ平行(交差角が小さい)な重なりは真の交差点ではないので解消しない
+                    v1 = pos[b] - pos[a]
+                    v2 = pos[d] - pos[c]
+                    denom = (v1.norm() * v2.norm()).item()
+                    if denom < 1e-9:
+                        continue
+                    cos_ = abs((v1 * v2).sum().item()) / denom
+                    cross_angle = math.acos(min(1.0, cos_))  # 0=平行, pi/2=直交
+                    if cross_angle < min_angle:
+                        continue
+                    found = (i, j, pt)
+                    break
                 if found is not None:
                     break
             if found is None:

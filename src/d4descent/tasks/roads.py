@@ -60,6 +60,19 @@ class RoadArgs(TaskArgs):
     angle_deadzone: float = math.radians(10)
     angle_penalty_exponent: float = 2.0
     angle_weight: float = 0.03
+    # cleanup で密集地帯を検出し、街路の交差点(ノード)と接続道路を間引く。cell_size のグリッドで
+    # 1セルのノード数が decimate_max_per_cell を超える密集セルの街路ノードを1代表へ統合する。
+    # 高密度域で街路がスクリブル状に過密化するのを「1セルあたり最大N交差点」の解像度に均す。
+    # 幹線道路ノード・エッジは触らない(不変条件B保持)、統合は連結を壊さない(不変条件A保持)。
+    decimate_dense: bool = True
+    decimate_cell_size: float = 0.06
+    decimate_max_per_cell: int = 2
+    # 交差解消(共有ノードを持たず交差する2辺を交点で分割, Repairability)。高密度域では交差が多数
+    # 生じ、全部解消するとノードが激増して中央が団子状に過密化する(実測で中央密度が約2.6倍)ため
+    # デフォルトOFF。過密化の解消は上の decimate_dense が担う。交差点は損失駆動のSnapでも作られる。
+    cleanup_resolve_crossings: bool = False
+    cleanup_min_seg: float = 0.04
+    cleanup_min_angle: float = math.radians(20)
     better_abs_eps: float = 1e-8
     rewrite_args: RoadRewriteArgs = field(default_factory=RoadRewriteArgs)
     road_collection_args: RoadCollectionArgs = field(default_factory=RoadCollectionArgs)
@@ -446,7 +459,21 @@ class RoadTask(Task[RoadNetwork, RoadRewrite, StateT]):
 
     def cleanup(self, collection: ObjectCollection[RoadNetwork]) -> ObjectCollection[RoadNetwork]:
         assert isinstance(collection, RoadNetworkCollection)
-        return self._Collection.from_objects([net.prune_orphan_nodes().cleanup() for net in collection])
+        highway_width = max(self.args.rewrite_args.width_classes)
+        result: list[RoadNetwork] = []
+        for net in collection:
+            net = net.prune_orphan_nodes()
+            if self.args.decimate_dense:
+                # 密集地帯の街路交差点・接続道路を間引く(高密度域のスクリブル過密化を解消)
+                net = net.decimate_dense(
+                    cell_size=self.args.decimate_cell_size,
+                    max_per_cell=self.args.decimate_max_per_cell,
+                    highway_width=highway_width,
+                )
+            if self.args.cleanup_resolve_crossings:
+                net = net.cleanup(min_seg=self.args.cleanup_min_seg, min_angle=self.args.cleanup_min_angle)
+            result.append(net)
+        return self._Collection.from_objects(result)
 
 
 class RoadDensityTask(RoadTask[None]):
