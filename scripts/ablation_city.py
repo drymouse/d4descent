@@ -227,6 +227,13 @@ def main() -> None:
         "--datasets", type=str, default=None, help="カンマ区切りでデータセット名を指定(既定: 全部 One,Dnt,Two)"
     )
     parser.add_argument("--no_save_images", action="store_true", help="各実行の最終画像を保存しない")
+    parser.add_argument(
+        "--stopping_patience",
+        type=int,
+        default=None,
+        help="指定すると、rewriteラウンドでこの回数だけ相対改善が無ければ早期終了する(既定None=無効、"
+        "常にn_stepsいっぱいまで実行)。バリアント間の比較の公平性より速度を優先したい場合に使う。",
+    )
     args = parser.parse_args()
 
     all_variants = make_variants()
@@ -255,7 +262,9 @@ def main() -> None:
         proposal_criterion="loss",
         proposal_steps=1,
         batch_param_count=8192,
-        stopping_patience=None,  # アブレーション比較なので早期終了せず予算いっぱいまで回す
+        # 既定はNone(早期終了なし、必ずn_stepsいっぱいまで実行)。バリアント間で同じ予算を
+        # 与えて比較するため。--stopping_patience を指定すると速度優先で早期終了できる。
+        stopping_patience=args.stopping_patience,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
