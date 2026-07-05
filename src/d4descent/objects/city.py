@@ -10,7 +10,7 @@ from ..context import Context
 from ..object_collection import ObjectCollection
 from ..util import maybe_detach
 from ..visualizer import MPLVisualizerAxes
-from .roads import _capsule_sdf, find_nearby_nodes, _is_reachable_without_edge, _seg_intersect_2d
+from .roads import _capsule_sdf, find_nearby_nodes, _is_reachable_without_edge
 
 
 # region Rewrites
@@ -254,41 +254,11 @@ class CityNetwork:
             n_edges = len(net.edges)
             if n_edges < 2:
                 break
-            pos = net.nodes.detach()
-            edges_list = net.edges.tolist()
-            found: Optional[tuple[int, int, torch.Tensor]] = None
-            for i in range(n_edges):
-                a, b = edges_list[i]
-                for j in range(i + 1, n_edges):
-                    c, d = edges_list[j]
-                    if len({a, b, c, d}) < 4:
-                        continue  # ノードを共有している(隣接エッジ)ので交差ではない
-                    hit, pt = _seg_intersect_2d(pos[a], pos[b], pos[c], pos[d])
-                    if not hit:
-                        continue
-                    # ガード1: 分割で生じるサブセグメントが短すぎる交差はスリバーを生むので解消しない
-                    if min(
-                        (pos[a] - pt).norm().item(), (pos[b] - pt).norm().item(),
-                        (pos[c] - pt).norm().item(), (pos[d] - pt).norm().item(),
-                    ) < min_seg:
-                        continue
-                    # ガード2: ほぼ平行(交差角が小さい)な重なりは真の交差点ではないので解消しない
-                    v1 = pos[b] - pos[a]
-                    v2 = pos[d] - pos[c]
-                    denom = (v1.norm() * v2.norm()).item()
-                    if denom < 1e-9:
-                        continue
-                    cos_ = abs((v1 * v2).sum().item()) / denom
-                    cross_angle = math.acos(min(1.0, cos_))  # 0=平行, pi/2=直交
-                    if cross_angle < min_angle:
-                        continue
-                    found = (i, j, pt)
-                    break
-                if found is not None:
-                    break
+            found = net._find_first_crossing(min_seg, min_angle)
             if found is None:
                 break
             i, j, pt = found
+            edges_list = net.edges.tolist()
             a, b = edges_list[i]
             c, d = edges_list[j]
             n0 = len(net.nodes)
@@ -304,6 +274,67 @@ class CityNetwork:
                 payload=net.payload,
             )
         return net
+
+    @torch.no_grad()
+    def _find_first_crossing(
+        self, min_seg: float, min_angle: float
+    ) -> Optional[tuple[int, int, torch.Tensor]]:
+        """
+        resolve_crossingsの探索部分。全辺ペアの交差判定をバッチ化されたtorch演算でまとめて行う
+        (素朴なPythonの二重ループ+ `.item()` は、辺数が増えると極端に遅くなるため)。
+        (i,j)の昇順(i<j)で最初に見つかった有効な交差を返す(逐次二重ループと同じ優先順位)。
+        """
+        device = self.nodes.device
+        pos = self.nodes.detach()
+        edges = self.edges
+        n_edges = len(edges)
+        a_idx, b_idx = edges[:, 0], edges[:, 1]
+        P = pos[a_idx].unsqueeze(1)  # (E,1,2)
+        Q = pos[b_idx].unsqueeze(1)  # (E,1,2)
+        R = pos[a_idx].unsqueeze(0)  # (1,E,2)
+        S = pos[b_idx].unsqueeze(0)  # (1,E,2)
+        V = Q - P  # (E,1,2)
+        W = S - R  # (1,E,2)
+
+        denom = V[..., 0] * W[..., 1] - V[..., 1] * W[..., 0]  # (E,E)
+        safe_denom = denom.masked_fill(denom.abs() < 1e-9, float("nan"))
+        diff = R - P  # (E,E,2)
+        t = (diff[..., 0] * W[..., 1] - diff[..., 1] * W[..., 0]) / safe_denom  # (E,E)
+        u = (diff[..., 0] * V[..., 1] - diff[..., 1] * V[..., 0]) / safe_denom  # (E,E)
+        hit = (t > 0.02) & (t < 0.98) & (u > 0.02) & (u < 0.98)
+
+        # 隣接エッジ(端点を共有する辺同士)は交差判定の対象外。i<jの組だけを見る(重複・自己対を除く)。
+        share = (
+            (a_idx.unsqueeze(1) == a_idx.unsqueeze(0))
+            | (a_idx.unsqueeze(1) == b_idx.unsqueeze(0))
+            | (b_idx.unsqueeze(1) == a_idx.unsqueeze(0))
+            | (b_idx.unsqueeze(1) == b_idx.unsqueeze(0))
+        )
+        upper = torch.triu(torch.ones(n_edges, n_edges, dtype=torch.bool, device=device), diagonal=1)
+        valid = hit & (~share) & upper
+        if not bool(valid.any()):
+            return None
+
+        pt = P + V * t.unsqueeze(-1)  # (E,E,2) 交点座標
+
+        # ガード1: 分割で生じるサブセグメントが短すぎる交差はスリバーを生むので解消しない
+        min_d = torch.minimum(
+            torch.minimum((P - pt).norm(dim=-1), (Q - pt).norm(dim=-1)),
+            torch.minimum((R - pt).norm(dim=-1), (S - pt).norm(dim=-1)),
+        )
+        valid = valid & (min_d >= min_seg)
+
+        # ガード2: ほぼ平行(交差角が小さい)な重なりは真の交差点ではないので解消しない
+        cross_denom = (V.norm(dim=-1) * W.norm(dim=-1)).clamp(min=1e-9)  # (E,E)
+        cos_ = ((V * W).sum(dim=-1)).abs() / cross_denom
+        cross_angle = torch.acos(cos_.clamp(max=1.0))
+        valid = valid & (cross_angle >= min_angle)
+
+        idx = valid.nonzero()  # 行優先(row-major)順 = 逐次二重ループと同じ (i,j)昇順
+        if len(idx) == 0:
+            return None
+        i, j = int(idx[0, 0].item()), int(idx[0, 1].item())
+        return i, j, pt[i, j]
 
     def gen_rewrite_specs(
         self,

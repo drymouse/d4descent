@@ -41,6 +41,9 @@ def main():
     # optim
     b.add("--optim.proposal_trigger", "step")
     b.add("--optim.propose_every", 25)
+    # cleanupを書き換え(propose_every=25)とほぼ同じ周期にする。25ぴったりだと毎回同じステップで
+    # cleanupと書き換えが重なってしまうため、あえて26にして周期をずらしている。
+    b.add("--optim.cleanup_every", 26)
     b.add("--optim.proposal_size", 64)
     b.add("--optim.clip_grad", 2.0)
     b.add("--optim.n_steps", 5000)
