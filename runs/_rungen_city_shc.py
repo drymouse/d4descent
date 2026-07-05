@@ -23,6 +23,10 @@ def main():
     b.add("--task.angle_deadzone", math.radians(10))  # 格子まわりの許容幅(ラジアン)
     b.add("--task.angle_penalty_exponent", 2.0)
     b.add("--task.angle_weight", 0.05)
+    # 5叉路以上の交差点への罰則。既存ノードへのSnap/Add集中で多叉路ができるのを抑える。
+    b.add("--task.max_degree_threshold", 5)
+    b.add("--task.degree_penalty_exponent", 2.0)
+    b.add("--task.degree_penalty_weight", 1.0)  # 意図的に大きい重み
     # cleanup で密集地帯のノードと接続道路を間引く(スクリブル過密化を抑える)
     b.add("--task.decimate_dense", True)
     b.add("--task.decimate_cell_size", 0.06)
@@ -36,6 +40,10 @@ def main():
     # 確保するために weight を1.0にする。
     b.add("--task.rewrite_args.add_anywhere_weight", 1.0)
     b.add("--task.rewrite_args.n_add_anywhere_candidates", 32)
+    # Branch: 辺の途中から積極的に新しい枝を伸ばす(Split+Addの複合)。degree_penaltyで多叉路を罰する
+    # 代わりに、既存ノードへのSnap/Add集中を避けてこちらの経路で密度を広げさせる。Addより強めに。
+    b.add("--task.rewrite_args.branch_weight", 2.0)
+    b.add("--task.rewrite_args.n_branch_candidates", 32)
     # optim
     b.add("--optim.proposal_trigger", "step")
     b.add("--optim.propose_every", 25)

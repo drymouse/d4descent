@@ -15,6 +15,7 @@ from ..objects.city import (
     CityRewriteAdd,
     CityRewriteAddAnywhere,
     CityRewriteArgs,
+    CityRewriteBranch,
     CityRewriteMerge,
     CityRewriteRemove,
     CityRewriteSnap,
@@ -46,6 +47,13 @@ class CityArgs(TaskArgs):
     angle_deadzone: float = math.radians(10)  # 格子まわりの許容幅(ラジアン)。密度カバレッジとの競合を緩和
     angle_penalty_exponent: float = 2.0
     angle_weight: float = 0.05
+    # 交差点の次数(接続する道路の本数)が max_degree_threshold 以上になることへの罰則。5叉路以上のような
+    # 不自然な交差点を強く抑制する。get_degree_penalty が excess=degree-threshold+1 の
+    # exponent乗をノードごとに罰する。Branch書き換え(辺の途中から積極的に新しい枝を伸ばす)と対にして
+    # 使う: 既存ノードへのSnap/Addに集中させる代わりに、辺の途中から分岐させてネットワークを広げさせる。
+    max_degree_threshold: int = 5
+    degree_penalty_exponent: float = 2.0
+    degree_penalty_weight: float = 1.0  # render01(スケール~0.1-0.3)やangle_weight(0.05)に対して意図的に大きい
     better_abs_eps: float = 1e-8
     # cleanup で密集地帯のノードと接続道路を間引く(Road文法のdecimate_denseと同型)。
     decimate_dense: bool = True
@@ -150,6 +158,7 @@ class CityTask(Task[CityNetwork, CityRewrite, StateT]):
         addany_specs = [s for s in specs if isinstance(s, CityRewriteAddAnywhere)]
         remove_specs = [s for s in specs if isinstance(s, CityRewriteRemove)]
         split_specs = [s for s in specs if isinstance(s, CityRewriteSplit)]
+        branch_specs = [s for s in specs if isinstance(s, CityRewriteBranch)]
         merge_specs = [s for s in specs if isinstance(s, CityRewriteMerge)]
         snap_specs = [s for s in specs if isinstance(s, CityRewriteSnap)]
         unsnap_specs = [s for s in specs if isinstance(s, CityRewriteUnsnap)]
@@ -262,6 +271,37 @@ class CityTask(Task[CityNetwork, CityRewrite, StateT]):
 
             sub_collections.append(_make_sub(n, n_each_nodes, n_each_edges, nodes_all, edges_all))
             ordered_specs.extend(split_specs)
+
+        # ---- Branch (辺の途中を分割し、そこから新しい枝を伸ばす。Split+Addの複合) ----
+        if branch_specs:
+            n = len(branch_specs)
+            n_each_nodes = n_base_nodes + 2  # 分岐点 + 枝の先端
+            n_each_edges = n_base_edges + 2  # 元エッジ(-1) + 新規3本(+3)
+            edge_ids = torch.tensor([s.edge_id for s in branch_specs], device=device)
+            split_pt = torch.tensor([[s.x, s.y] for s in branch_specs], device=device, dtype=dtype)
+            branch_pt = torch.tensor([[s.bx, s.by] for s in branch_specs], device=device, dtype=dtype)
+            ab = base_edges[edge_ids]  # (n,2)
+            keep_mask = all_idx_edges.unsqueeze(0) != edge_ids.unsqueeze(1)
+            keep_indices = all_idx_edges.unsqueeze(0).expand(n, -1)[keep_mask].reshape(n, n_base_edges - 1)
+
+            nodes_exp = base_nodes.unsqueeze(0).expand(n, -1, -1)
+            nodes_all = torch.cat([nodes_exp, split_pt.unsqueeze(1), branch_pt.unsqueeze(1)], dim=1).reshape(-1, 2)
+
+            edges_exp = base_edges.unsqueeze(0).expand(n, -1, -1)
+            kept_edges = torch.gather(edges_exp, 1, keep_indices.unsqueeze(-1).expand(-1, -1, 2))
+            split_id = torch.full((n,), n_base_nodes, device=device, dtype=torch.long)
+            branch_id = torch.full((n,), n_base_nodes + 1, device=device, dtype=torch.long)
+            new_edge1 = torch.stack([ab[:, 0], split_id], dim=-1)
+            new_edge2 = torch.stack([split_id, ab[:, 1]], dim=-1)
+            new_edge3 = torch.stack([split_id, branch_id], dim=-1)
+            edges_local = torch.cat(
+                [kept_edges, new_edge1.unsqueeze(1), new_edge2.unsqueeze(1), new_edge3.unsqueeze(1)], dim=1
+            )
+            offset = (torch.arange(n, device=device) * n_each_nodes).view(n, 1, 1)
+            edges_all = (edges_local + offset).reshape(-1, 2)
+
+            sub_collections.append(_make_sub(n, n_each_nodes, n_each_edges, nodes_all, edges_all))
+            ordered_specs.extend(branch_specs)
 
         # ---- Merge ----
         if merge_specs:
@@ -424,6 +464,11 @@ class CityRasterTask(RasterLossMixin[CityNetwork, CityRewrite, None], CityTask[N
         if self.args.angle_weight != 0.0:
             angle_penalty = collection.get_angle_penalty(self.args.angle_penalty_exponent, self.args.angle_deadzone)
             losses = losses + self.args.angle_weight * angle_penalty
+        if self.args.degree_penalty_weight != 0.0:
+            degree_penalty = collection.get_degree_penalty(
+                self.args.max_degree_threshold, self.args.degree_penalty_exponent
+            )
+            losses = losses + self.args.degree_penalty_weight * degree_penalty
         return losses, xtra
 
     def visualize(self, collection: ObjectCollection[CityNetwork], step: int, loss: float, state: None) -> np.ndarray:

@@ -33,6 +33,7 @@ class CityRewriteType(Enum):
     Merge = 5
     Snap = 6
     Unsnap = 7
+    Branch = 8
 
 
 @dataclass
@@ -81,6 +82,24 @@ class CityRewriteSplit(CityRewrite):
 
 
 @dataclass
+class CityRewriteBranch(CityRewrite):
+    """
+    既存エッジ edge_id を (x,y) で分割して新規ノードを作り、そこから新規ノード (bx,by) へ
+    短い枝を伸ばす(Split+Addの複合操作)。単独のSplitは幾何形状を変えないため損失を改善せず
+    採択されないが、この複合操作は新しい枝の分だけ損失を即座に改善しうる。5叉路以上の交差点への
+    罰則(degree_penalty)の代わりに、既存ノードへのSnap/Addに集中させず辺の途中から積極的に
+    新しい分岐点を作ってネットワークを広げるために導入する。逆操作: 枝をRemoveしてMerge。
+    """
+
+    rewrite_type: CityRewriteType = field(default=CityRewriteType.Branch, init=False)
+    edge_id: int
+    x: float
+    y: float
+    bx: float
+    by: float
+
+
+@dataclass
 class CityRewriteMerge(CityRewrite):
     """次数2のノードで、両側のエッジがほぼ共線の場合に1本へ統合する。逆操作: Split。"""
 
@@ -117,6 +136,8 @@ class CityRewriteArgs:
     n_add_candidates: int = 32
     n_add_anywhere_candidates: int = 32
     n_split_candidates: int = 16
+    n_branch_candidates: int = 32
+    branch_t_range: tuple[float, float] = (0.15, 0.85)  # エッジ上の分岐点の位置(両端の近くは避ける)
     snap_radius: float = 0.05
     max_add_anywhere_hops: int = 6  # AddAnywhereの鎖の最大エッジ数。1提案で長大な橋を作らせない
     merge_angle_eps: float = math.radians(5.0)  # 反対方向(=直線)からのずれがこれ以内ならMerge可
@@ -128,6 +149,10 @@ class CityRewriteArgs:
     merge_weight: float = 1.0
     snap_weight: float = 1.0
     unsnap_weight: float = 1.0
+    # 辺の途中から新しい分岐を積極的に伸ばす(Branch)。5叉路以上への罰則(degree_penalty)の代わりに、
+    # 既存ノードへのSnap/Addで交差点を密集させず、辺の途中から新しい分岐点を作ってネットワークを
+    # 広げる経路を確保する。既定でAddより強めにして"積極的に"分岐を試みるようにする。
+    branch_weight: float = 2.0
 
 
 # endregion
@@ -320,6 +345,24 @@ class CityNetwork:
                 x1, y1 = pos[b].tolist()
                 specs.append(CityRewriteSplit(edge_id=eid, x=x0 + (x1 - x0) * t, y=y0 + (y1 - y0) * t))
 
+        # ---- Branch: 辺の途中から新しい枝を積極的に伸ばす(Split+Addの複合) ----
+        # 既存ノードへのSnap/Addが集中して5叉路以上を作ってしまう(degree_penaltyで罰される)代わりに、
+        # 辺の途中から新しい分岐点を作ってネットワークを広げる経路を提供する。
+        if args.branch_weight > 0 and n_edges > 0:
+            n_cand = max(round(args.n_branch_candidates * args.branch_weight), 1)
+            t0, t1 = args.branch_t_range
+            for _ in range(n_cand):
+                eid = random.randrange(n_edges)
+                a, b = edges_list[eid]
+                t = random.uniform(t0, t1)
+                x0, y0 = pos[a].tolist()
+                x1, y1 = pos[b].tolist()
+                sx, sy = x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
+                ang = random.random() * 2 * math.pi
+                length = random.uniform(*args.length_range)
+                bx, by = sx + length * math.cos(ang), sy + length * math.sin(ang)
+                specs.append(CityRewriteBranch(edge_id=eid, x=sx, y=sy, bx=bx, by=by))
+
         # ---- Merge: ほぼ共線の次数2ノードを統合(Splitの逆操作) ----
         if args.merge_weight > 0:
             for ni in live_nodes:
@@ -399,6 +442,19 @@ class CityNetwork:
             new_edges = torch.tensor([[a, n0], [n0, b]], dtype=torch.long, device=device)
             return CityNetwork(
                 nodes=torch.cat([self.nodes, new_node], dim=0), edges=torch.cat([self.edges[keep], new_edges], dim=0)
+            )
+        elif isinstance(spec, CityRewriteBranch):
+            n0 = len(self.nodes)  # 分岐点(Splitで生じる新規ノード)
+            n1 = n0 + 1  # 枝の先端
+            a, b = self.edges[spec.edge_id].tolist()
+            split_node = torch.tensor([[spec.x, spec.y]], dtype=dtype, device=device)
+            branch_node = torch.tensor([[spec.bx, spec.by]], dtype=dtype, device=device)
+            keep = torch.ones(len(self.edges), dtype=torch.bool, device=device)
+            keep[spec.edge_id] = False
+            new_edges = torch.tensor([[a, n0], [n0, b], [n0, n1]], dtype=torch.long, device=device)
+            return CityNetwork(
+                nodes=torch.cat([self.nodes, split_node, branch_node], dim=0),
+                edges=torch.cat([self.edges[keep], new_edges], dim=0),
             )
         elif isinstance(spec, CityRewriteMerge):
             keep = torch.ones(len(self.edges), dtype=torch.bool, device=device)
@@ -528,6 +584,25 @@ class CityNetwork:
                 next_edge_id += 2
                 n_next += 1
                 n_alive += 1
+            elif isinstance(spec, CityRewriteBranch):
+                if spec.edge_id in touched_edges or spec.edge_id not in live_edges:
+                    continue
+                touched_edges.add(spec.edge_id)
+                removed.add(spec.edge_id)
+                a, b = live_edges.pop(spec.edge_id)
+                split_id = n_next
+                branch_id = n_next + 1
+                added_nodes.append(torch.tensor([[spec.x, spec.y]], dtype=dtype, device=device))
+                added_nodes.append(torch.tensor([[spec.bx, spec.by]], dtype=dtype, device=device))
+                added_edges.append(
+                    torch.tensor([[a, split_id], [split_id, b], [split_id, branch_id]], dtype=torch.long, device=device)
+                )
+                live_edges[next_edge_id] = (a, split_id)
+                live_edges[next_edge_id + 1] = (split_id, b)
+                live_edges[next_edge_id + 2] = (split_id, branch_id)
+                next_edge_id += 3
+                n_next += 2
+                n_alive += 2
             elif isinstance(spec, CityRewriteMerge):
                 if (
                     spec.edge_id_a in touched_edges
@@ -865,6 +940,30 @@ class CityNetworkCollection(ObjectCollection[CityNetwork]):
         result = torch.scatter_reduce(result, 0, node_index_of[node_of_gap], intra_penalty, reduce="sum")
         result = torch.scatter_reduce(result, 0, node_index_of, wrap_penalty, reduce="sum")
         return result
+
+    def get_degree_penalty(self, threshold: int = 5, exponent: float = 2.0) -> torch.Tensor:
+        """
+        次数(接続する辺の数)が threshold 以上のノード(=threshold本以上の道路が集まる交差点)に
+        罰則を課す。不自然な多叉路(5叉路以上)の形成を抑制する。
+        excess = degree - threshold + 1 (threshold以上のときのみ正) として、罰則 = excess^exponent の
+        ネットワークごとの総和を返す。
+
+        returns: (n_networks,)
+        """
+        device = self.device()
+        total_nodes = len(self.nodes)
+        n_networks = len(self.ids)
+        if len(self.edges) == 0:
+            return torch.zeros(n_networks, device=device)
+
+        degree = torch.zeros(total_nodes, dtype=torch.long, device=device)
+        degree.scatter_add_(0, self.edges.flatten(), torch.ones(2 * len(self.edges), dtype=torch.long, device=device))
+        excess = (degree - threshold + 1).clamp(min=0).to(dtype=self.nodes.dtype)
+        penalty = excess.pow(exponent)
+
+        node_index_of = self._build_node_index_of()
+        result = torch.zeros(n_networks, dtype=self.nodes.dtype, device=device)
+        return torch.scatter_reduce(result, 0, node_index_of, penalty, reduce="sum")
 
     @classmethod
     def patch_args(cls, args: CityCollectionArgs) -> Type["CityNetworkCollection"]:
