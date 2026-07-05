@@ -27,7 +27,7 @@ render:
   blur: 0.7071067811865475
 optim:
   proposal_trigger: step
-  propose_every: 50
+  propose_every: 25
   proposal_size: 64  # SDSは1件ごとの評価コストが重いので、全候補ではなくここで間引く(既定0=全件は危険)
   scheduler: none
   lr: 0.01
@@ -37,3 +37,4 @@ optim:
   proposal_steps: 1
 prompt_suffix: "top-down map, black lines on white background"
 restart: false
+save_path: "output/interactive"
