@@ -19,6 +19,11 @@ def main():
     b.add("---task", "configs/tasks/city.yaml")
     b.add("--task.cost_weight", 1e-4)  # 建設コストの離散正則化(冗長な道路の追加を少しだけ抑える)
     b.add("--task.size_weight", 0.0)  # 連続コスト。render01が既に1の場所は追加道路の損失が下がらないため既定は0
+    # 90度交差の選好(原則3)。gapが90度格子{90,180,270}°からずれることを罰する。render01損失だけでは
+    # 街路が任意角度で交差するスクリブルになりがちなので、これを加えて格子状の街路を促す。
+    b.add("--task.angle_deadzone", math.radians(10))  # 格子まわりの許容幅(ラジアン)
+    b.add("--task.angle_penalty_exponent", 2.0)
+    b.add("--task.angle_weight", 0.05)
     # cleanup で密集地帯のノードと接続道路を間引く(スクリブル過密化を抑える)
     b.add("--task.decimate_dense", True)
     b.add("--task.decimate_cell_size", 0.06)

@@ -1,3 +1,4 @@
+import math
 import random
 from dataclasses import dataclass, field
 from typing import Optional, Union
@@ -38,6 +39,13 @@ class CityArgs(TaskArgs):
     # 済みの領域を通るだけの道路)を縮める方向の勾配を作る。render01は既に1の場所では追加の道路が
     # 損失を下げないため、0でも動作はするが、経路の無駄な蛇行を抑えたい場合は正の値にする。
     size_weight: float = 0.0
+    # 交差点が90度格子 {90°,180°,270°} からずれることへの罰則(原則3: 90度交差を選好)。
+    # get_angle_penalty が各ノードの隣接方向間のgapを90度格子からのずれで罰する。90/180/270°
+    # (直進・直角カーブ・T字・十字)は無罰、鋭角(→0°)や斜め(45°,135°)は罰する。render01損失だけだと
+    # 街路が任意角度で交差するスクリブルになりがちなので、これを連続損失に加えて格子状の街路を促す。
+    angle_deadzone: float = math.radians(10)  # 格子まわりの許容幅(ラジアン)。密度カバレッジとの競合を緩和
+    angle_penalty_exponent: float = 2.0
+    angle_weight: float = 0.05
     better_abs_eps: float = 1e-8
     # cleanup で密集地帯のノードと接続道路を間引く(Road文法のdecimate_denseと同型)。
     decimate_dense: bool = True
@@ -413,6 +421,9 @@ class CityRasterTask(RasterLossMixin[CityNetwork, CityRewrite, None], CityTask[N
         if self.args.size_weight != 0.0:
             cost = collection.get_construction_costs()
             losses = losses + self.args.size_weight * cost
+        if self.args.angle_weight != 0.0:
+            angle_penalty = collection.get_angle_penalty(self.args.angle_penalty_exponent, self.args.angle_deadzone)
+            losses = losses + self.args.angle_weight * angle_penalty
         return losses, xtra
 
     def visualize(self, collection: ObjectCollection[CityNetwork], step: int, loss: float, state: None) -> np.ndarray:

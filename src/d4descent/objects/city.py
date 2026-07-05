@@ -804,6 +804,68 @@ class CityNetworkCollection(ObjectCollection[CityNetwork]):
         denom = (2 * v - 5).clamp(min=1.0)
         return cycles / denom
 
+    def get_angle_penalty(self, exponent: float = 2.0, deadzone: float = 0.0) -> torch.Tensor:
+        """
+        各ノードにおいて、接続する道路同士の"隣接する"方向間の角度差(gap)が 90度の格子
+        {90°,180°,270°} からどれだけずれているかを罰する(Road文法のget_angle_penaltyと同型)。
+        gapが 90/180/270°(=直進・直角カーブ・T字・十字)なら罰則0、鋭角(→0°)や斜め(45°,135°)は
+        罰される。次数1以下のノードは角度が定義できないため対象外。
+
+        gap g に対し dev(g) = min(|g-90°|, |g-180°|, |g-270°|)、罰則 = relu(dev - deadzone)^exponent。
+
+        returns: (n_networks,)
+        """
+        device = self.device()
+        total_nodes = len(self.nodes)
+        n_networks = len(self.ids)
+        n_edges = len(self.edges)
+        if n_edges == 0:
+            return torch.zeros(n_networks, device=device)
+
+        center = torch.cat([self.edges[:, 0], self.edges[:, 1]])  # (2E,)
+        other = torch.cat([self.edges[:, 1], self.edges[:, 0]])  # (2E,)
+        vec = self.nodes[other] - self.nodes[center]  # (2E, 2)
+        two_pi = 2 * math.pi
+        half_pi = math.pi / 2
+        theta = torch.remainder(torch.atan2(vec[:, 1], vec[:, 0]), two_pi)  # [0, 2pi)
+
+        # (center, theta) の順でソートすると、同一ノードに属する方向が角度順に並ぶ
+        key = center.to(theta.dtype) * (two_pi + 1.0) + theta
+        order = torch.argsort(key)
+        center_sorted = center[order]
+        theta_sorted = theta[order]
+
+        diffs = theta_sorted[1:] - theta_sorted[:-1]  # (2E-1,)
+        same_group = center_sorted[1:] == center_sorted[:-1]  # 同じノードに属する隣接ペアか
+        node_of_gap = center_sorted[:-1]  # (2E-1,)
+
+        # 周回ギャップ = 2π - (そのノードの"内部"gapの総和)
+        intra_gap = torch.where(same_group, diffs, torch.zeros_like(diffs))
+        sum_intra = torch.zeros(total_nodes, dtype=theta.dtype, device=device)
+        sum_intra.scatter_add_(0, node_of_gap, intra_gap)
+        wrap_gap = (two_pi - sum_intra).clamp(min=0.0)  # (total_nodes,)
+
+        degree = torch.zeros(total_nodes, dtype=torch.long, device=device)
+        degree.scatter_add_(0, self.edges.flatten(), torch.ones(2 * n_edges, dtype=torch.long, device=device))
+        has_gaps = degree >= 2
+
+        def _lattice_penalty(g: torch.Tensor) -> torch.Tensor:
+            dev = torch.minimum(
+                torch.minimum((g - half_pi).abs(), (g - math.pi).abs()), (g - 3 * half_pi).abs()
+            )
+            return (dev - deadzone).clamp(min=0.0).pow(exponent)
+
+        intra_penalty = torch.where(same_group, _lattice_penalty(diffs), torch.zeros_like(diffs))
+        wrap_penalty = torch.where(
+            has_gaps, _lattice_penalty(wrap_gap), torch.zeros(total_nodes, dtype=theta.dtype, device=device)
+        )
+
+        node_index_of = self._build_node_index_of()
+        result = torch.zeros(n_networks, dtype=theta.dtype, device=device)
+        result = torch.scatter_reduce(result, 0, node_index_of[node_of_gap], intra_penalty, reduce="sum")
+        result = torch.scatter_reduce(result, 0, node_index_of, wrap_penalty, reduce="sum")
+        return result
+
     @classmethod
     def patch_args(cls, args: CityCollectionArgs) -> Type["CityNetworkCollection"]:
         return type(
