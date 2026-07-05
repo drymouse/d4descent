@@ -57,7 +57,11 @@ def main():
     b.add("--optim.proposal_size", 64)
     b.add("--optim.clip_grad", 2.0)
     b.add("--optim.n_steps", 5000)
-    b.add("--optim.stopping_patience", 25)
+    # render01のMSEは被覆が進むほどloss自体が小さくなるため、相対改善(stopping_eps)ベースの早期終了だと
+    # 「まだ広い未被覆領域が残っているのに、1回の書き換えで稼げる相対改善率がたまたま小さくなった」だけで
+    # 誤って収束判定してしまう(実測: 5000ステップ中1000ステップ程度で打ち切られ、被覆が全く進んでいなかった)。
+    # n_steps の予算いっぱいまで回させるため、stopping_patience は大きく緩める(実質無効化に近い)。
+    b.add("--optim.stopping_patience", 100)
     b.add("--optim.batch_param_count", 8192)
     b.add("--optim.proposal_criterion", "loss")
     b.add("--optim.proposal_steps", 1)
