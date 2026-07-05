@@ -10,7 +10,7 @@ from ..context import Context
 from ..object_collection import ObjectCollection
 from ..util import maybe_detach
 from ..visualizer import MPLVisualizerAxes
-from .roads import _capsule_sdf, find_nearby_nodes, _is_reachable_without_edge
+from .roads import _capsule_sdf, find_nearby_nodes, _is_reachable_without_edge, _seg_intersect_2d
 
 
 # region Rewrites
@@ -233,6 +233,77 @@ class CityNetwork:
             return self
         new_edges = torch.tensor(new_edges_list, dtype=torch.long, device=device)
         return CityNetwork(nodes=self.nodes, edges=new_edges, id=self.id, payload=self.payload).prune_orphan_nodes()
+
+    @torch.no_grad()
+    def resolve_crossings(
+        self, max_iter: int = 4, min_seg: float = 0.04, min_angle: float = math.radians(20.0)
+    ) -> "CityNetwork":
+        """
+        共有ノードを持たずに幾何的に交差してしまった2辺(勾配降下でノード位置が動いた結果生じうる)を
+        検出し、交点に新規ノードを1つ挿入して両辺をそこで分割する(Road文法のcleanupと同型)。
+        「交差する道路は必ずノードを共有する」という制約に対する修復操作(Repairability)。
+
+        ただし高密度領域では街路が多数交差し、交差を分割するたびに短いエッジが増えて更に交差…と
+        断片化が暴走してノードが過密化しうる(Road文法での実測で中央ノード密度が約2倍に膨らんだ)。
+        これを防ぐため次の交差は解消しない(スリバーを作らない):
+        - 分割で生じる4本のサブセグメントのいずれかが min_seg 未満になる交差(端点近傍・微小な交差)
+        - 2辺の交差角が min_angle 未満の交差(ほぼ平行に重なっているだけ。真の交差点ではない)
+        """
+        net = self
+        for _ in range(max_iter):
+            n_edges = len(net.edges)
+            if n_edges < 2:
+                break
+            pos = net.nodes.detach()
+            edges_list = net.edges.tolist()
+            found: Optional[tuple[int, int, torch.Tensor]] = None
+            for i in range(n_edges):
+                a, b = edges_list[i]
+                for j in range(i + 1, n_edges):
+                    c, d = edges_list[j]
+                    if len({a, b, c, d}) < 4:
+                        continue  # ノードを共有している(隣接エッジ)ので交差ではない
+                    hit, pt = _seg_intersect_2d(pos[a], pos[b], pos[c], pos[d])
+                    if not hit:
+                        continue
+                    # ガード1: 分割で生じるサブセグメントが短すぎる交差はスリバーを生むので解消しない
+                    if min(
+                        (pos[a] - pt).norm().item(), (pos[b] - pt).norm().item(),
+                        (pos[c] - pt).norm().item(), (pos[d] - pt).norm().item(),
+                    ) < min_seg:
+                        continue
+                    # ガード2: ほぼ平行(交差角が小さい)な重なりは真の交差点ではないので解消しない
+                    v1 = pos[b] - pos[a]
+                    v2 = pos[d] - pos[c]
+                    denom = (v1.norm() * v2.norm()).item()
+                    if denom < 1e-9:
+                        continue
+                    cos_ = abs((v1 * v2).sum().item()) / denom
+                    cross_angle = math.acos(min(1.0, cos_))  # 0=平行, pi/2=直交
+                    if cross_angle < min_angle:
+                        continue
+                    found = (i, j, pt)
+                    break
+                if found is not None:
+                    break
+            if found is None:
+                break
+            i, j, pt = found
+            a, b = edges_list[i]
+            c, d = edges_list[j]
+            n0 = len(net.nodes)
+            keep = torch.ones(n_edges, dtype=torch.bool, device=net.nodes.device)
+            keep[i] = False
+            keep[j] = False
+            new_node = pt.unsqueeze(0)
+            new_edges = torch.tensor([[a, n0], [n0, b], [c, n0], [n0, d]], dtype=torch.long, device=net.nodes.device)
+            net = CityNetwork(
+                nodes=torch.cat([net.nodes, new_node], dim=0),
+                edges=torch.cat([net.edges[keep], new_edges], dim=0),
+                id=net.id,
+                payload=net.payload,
+            )
+        return net
 
     def gen_rewrite_specs(
         self,

@@ -1,3 +1,4 @@
+import math
 import random
 from dataclasses import dataclass, field
 from typing import Optional, Union
@@ -43,6 +44,15 @@ class CityArgs(TaskArgs):
     decimate_dense: bool = True
     decimate_cell_size: float = 0.06
     decimate_max_per_cell: int = 2
+    # cleanup で、ノードを共有せずに幾何的に交差してしまった2辺(勾配降下でノード位置が動いた結果
+    # 生じうる)を検出し、交点にノードを挿入して分割する(Repairability: 「交差する道路は必ず
+    # ノードを共有する」という制約への修復)。高密度領域で交差解消が連鎖して断片化が暴走しうるため、
+    # min_seg/min_angle のガードで小さすぎる交差・ほぼ平行な重なりは対象から除外している。
+    # (Road文法での実測: このガード無しで有効化すると中央ノード密度が約2倍に膨らんだ)
+    cleanup_resolve_crossings: bool = True
+    cleanup_max_iter: int = 4  # cleanup呼び出し1回あたりに解消する交差点の数の上限
+    cleanup_min_seg: float = 0.04
+    cleanup_min_angle: float = math.radians(20)
     rewrite_args: CityRewriteArgs = field(default_factory=CityRewriteArgs)
     city_collection_args: CityCollectionArgs = field(default_factory=CityCollectionArgs)
 
@@ -364,6 +374,12 @@ class CityTask(Task[CityNetwork, CityRewrite, StateT]):
         result: list[CityNetwork] = []
         for net in collection:
             net = net.prune_orphan_nodes()
+            if self.args.cleanup_resolve_crossings:
+                net = net.resolve_crossings(
+                    max_iter=self.args.cleanup_max_iter,
+                    min_seg=self.args.cleanup_min_seg,
+                    min_angle=self.args.cleanup_min_angle,
+                )
             if self.args.decimate_dense:
                 net = net.decimate_dense(cell_size=self.args.decimate_cell_size, max_per_cell=self.args.decimate_max_per_cell)
             result.append(net)

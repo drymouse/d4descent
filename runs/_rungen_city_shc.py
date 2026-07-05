@@ -18,7 +18,13 @@ def main():
     b.add("---task", "configs/tasks/city.yaml")
     b.add("--task.cost_weight", 1e-4)  # 建設コストの離散正則化(冗長な道路の追加を少しだけ抑える)
     b.add("--task.size_weight", 0.0)  # 連続コスト。render01が既に1の場所は追加道路の損失が下がらないため既定は0
-    # cleanup で密集地帯のノードと接続道路を間引く(スクリブル過密化を抑える)
+    # cleanup で、ノードを共有せず幾何的に交差した2辺を検出し交点にノードを挿入して分割する
+    # (Repairability: 交差する道路は必ずノードを共有する、という制約への修復)。
+    b.add("--task.cleanup_resolve_crossings", True)
+    b.add("--task.cleanup_max_iter", 4)
+    b.add("--task.cleanup_min_seg", 0.04)
+    b.add("--task.cleanup_min_angle", math.radians(20))
+    # cleanup で密集地帯のノードと接続道路を間引く(交差解消の断片化暴走に対する安全弁も兼ねる)
     b.add("--task.decimate_dense", True)
     b.add("--task.decimate_cell_size", 0.06)
     b.add("--task.decimate_max_per_cell", 2)
