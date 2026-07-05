@@ -27,6 +27,12 @@ def main():
     b.add("--task.max_degree_threshold", 5)
     b.add("--task.degree_penalty_exponent", 2.0)
     b.add("--task.degree_penalty_weight", 1.0)  # 意図的に大きい重み
+    # 輸送効率性(circuity/迂回率)の微分可能な近似罰則。実験的機能・計算コストがあるため既定はOFF(0.0)。
+    # 有効にする場合は --task.transport_efficiency_weight を正の値に。
+    b.add("--task.transport_efficiency_weight", 0.0)
+    b.add("--task.transport_efficiency_n_pairs", 16)
+    b.add("--task.transport_efficiency_n_iters", 24)
+    b.add("--task.transport_efficiency_beta", 40.0)
     # cleanup で密集地帯のノードと接続道路を間引く(スクリブル過密化を抑える)
     b.add("--task.decimate_dense", True)
     b.add("--task.decimate_cell_size", 0.06)

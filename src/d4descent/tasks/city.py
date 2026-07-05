@@ -54,6 +54,22 @@ class CityArgs(TaskArgs):
     max_degree_threshold: int = 5
     degree_penalty_exponent: float = 2.0
     degree_penalty_weight: float = 1.0  # render01(スケール~0.1-0.3)やangle_weight(0.05)に対して意図的に大きい
+    # 輸送効率性(circuity/迂回率)の微分可能な近似罰則(network_metrics.compute_transport_efficiencyの
+    # 学習中版)。厳密な最短経路(Dijkstra)は勾配が流れないため、エントロピー正則化Bellman-Ford
+    # (softmin緩和、get_transport_efficiency_penalty)で近似する。人口密度に比例してサンプルした
+    # transport_efficiency_n_pairs 組のOD(起点・終点)点対に対し、道路網上の近似最短経路長が
+    # 直線距離をどれだけ超過するか(=迂回のロス)を連続損失に加える。
+    # 近似・計算コストの両面で実験的機能のため既定はOFF(0.0)。有効にする場合は正の値を指定する。
+    transport_efficiency_weight: float = 0.0
+    transport_efficiency_n_pairs: int = 16  # OD点対の数(固定、タスク初期化時に人口密度で1回サンプル)
+    transport_efficiency_n_iters: int = 24  # Bellman-Ford緩和の反復回数(≒考慮する最大ホップ数。網の直径より
+    # 十分大きくする必要がある。足りないと遠いOD対の近似距離が過小評価される)
+    # softminの逆温度。大きいほど厳密なminに近づく(合成グラフでの検証: beta=8 は真の最短経路を大幅に
+    # 過小評価、beta=30~50 で概ね一致、beta=200でほぼ厳密値)。小さすぎると迂回のロスを見逃す
+    # (過小評価分はclampで0に潰れ、見た目上"迂回なし"に見えてしまう)。大きすぎるとほぼhard-minと
+    # 同じになり勾配が鋭く/疎になる。
+    transport_efficiency_beta: float = 40.0
+    transport_efficiency_min_dist: float = 0.2  # OD点対の最小直線距離(近すぎる点対は意味のある"移動"にならない)
     better_abs_eps: float = 1e-8
     # cleanup で密集地帯のノードと接続道路を間引く(Road文法のdecimate_denseと同型)。
     decimate_dense: bool = True
@@ -424,6 +440,11 @@ class CityRasterTask(RasterLossMixin[CityNetwork, CityRewrite, None], CityTask[N
         CityTask.__init__(self, args, render_args, device)
         RasterLossMixin.__init__(self, raster_args, target_img)
         self._add_anywhere_targets = self._precompute_add_anywhere_targets(target_img)
+        self._od_points: Optional[torch.Tensor] = None
+        if self.args.transport_efficiency_weight != 0.0:
+            self._od_points = self._precompute_od_pairs(
+                target_img, self.args.transport_efficiency_n_pairs, self.args.transport_efficiency_min_dist
+            )
 
     def _precompute_add_anywhere_targets(self, target_img_raw: torch.Tensor, n_points: int = 4096) -> torch.Tensor:
         """
@@ -447,6 +468,31 @@ class CityRasterTask(RasterLossMixin[CityNetwork, CityRewrite, None], CityTask[N
             py = rows / (size - 1) * (lim1 - lim0) + lim0
         return torch.stack([px, py], dim=-1).cpu()  # (n_points, 2)
 
+    def _precompute_od_pairs(
+        self, target_img_raw: torch.Tensor, n_pairs: int, min_dist: float
+    ) -> torch.Tensor:
+        """
+        輸送効率性の近似罰則(get_transport_efficiency_penalty)が使う、固定のOD(起点・終点)点対を
+        人口密度に比例して事前サンプルする。近すぎる点対(min_dist未満)は意味のある"移動"にならない
+        ため除外する。
+
+        returns: (k, 2, 2)  k <= n_pairs (十分な数の有効な点対が見つからない場合は少なくなりうる)
+        """
+        pool = self._precompute_add_anywhere_targets(target_img_raw, n_points=max(2048, n_pairs * 32)).to(
+            target_img_raw.device
+        )
+        perm_src = pool[torch.randperm(len(pool))]
+        perm_dst = pool[torch.randperm(len(pool))]
+        d = (perm_src - perm_dst).norm(dim=-1)
+        keep = d > min_dist
+        src_ok = perm_src[keep]
+        dst_ok = perm_dst[keep]
+        if len(src_ok) == 0:
+            src_ok = perm_src[:1]
+            dst_ok = perm_dst[:1]
+        k = min(n_pairs, len(src_ok))
+        return torch.stack([src_ok[:k], dst_ok[:k]], dim=1)  # (k, 2, 2)
+
     def get_add_anywhere_targets(self) -> Optional[torch.Tensor]:
         return self._add_anywhere_targets
 
@@ -469,6 +515,13 @@ class CityRasterTask(RasterLossMixin[CityNetwork, CityRewrite, None], CityTask[N
                 self.args.max_degree_threshold, self.args.degree_penalty_exponent
             )
             losses = losses + self.args.degree_penalty_weight * degree_penalty
+        if self.args.transport_efficiency_weight != 0.0 and self._od_points is not None:
+            eff_penalty = collection.get_transport_efficiency_penalty(
+                self._od_points,
+                n_iters=self.args.transport_efficiency_n_iters,
+                beta=self.args.transport_efficiency_beta,
+            )
+            losses = losses + self.args.transport_efficiency_weight * eff_penalty
         return losses, xtra
 
     def visualize(self, collection: ObjectCollection[CityNetwork], step: int, loss: float, state: None) -> np.ndarray:

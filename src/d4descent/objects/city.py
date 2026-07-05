@@ -965,6 +965,103 @@ class CityNetworkCollection(ObjectCollection[CityNetwork]):
         result = torch.zeros(n_networks, dtype=self.nodes.dtype, device=device)
         return torch.scatter_reduce(result, 0, node_index_of, penalty, reduce="sum")
 
+    def get_transport_efficiency_penalty(
+        self, od_points: torch.Tensor, n_iters: int = 16, beta: float = 8.0
+    ) -> torch.Tensor:
+        """
+        「輸送効率性」(circuity/迂回率, network_metrics.compute_transport_efficiencyと同じ概念)を
+        微分可能に近似する。厳密な最短経路(Dijkstra)は勾配が流れないため、エントロピー正則化
+        Bellman-Ford(softmin緩和)で近似する:
+
+            dist^(0)[v] = 0 (v=起点), そうでなければ大きな定数
+            dist^(t+1)[v] = softmin_{(u,v) in E, self-loop含む} (dist^(t)[u] + w(u,v))
+            softmin(x) = -1/beta * logsumexp(-beta * x)   (beta->∞で厳密なminに収束)
+
+        n_iters回の緩和で「高々n_iters ホップ以内の近似最短経路長」が得られる(それより遠い場合は
+        過小評価される)。自己ループ(重み0)を経路候補に含めることで、min操作を一切使わずsoftminのみで
+        構成できる(全体が滑らかに微分可能)。
+
+        od_points: (K, 2, 2) 固定のOD(起点・終点)点対。空間上の座標(全ネットワーク共通、Task側が
+        人口密度に比例してサンプルする)。各ネットワークで、各OD点に最も近いノードを起点・終点とする
+        (最近傍探索自体は勾配を止める。AddAnywhereの最近傍選択と同じやり方)。
+
+        excess = relu(soft_path_length - 直線距離) をOD対平均してネットワークごとに返す。
+        直線距離は経路長の理論的下限なので、これは「どれだけ余分に迂回しているか」を表す。
+
+        returns: (n_networks,)
+        """
+        device = self.device()
+        dtype = self.nodes.dtype
+        n_networks = len(self.ids)
+        zero = torch.zeros((), dtype=dtype, device=device)
+        if len(self.edges) == 0 or od_points.shape[0] == 0:
+            return zero.expand(n_networks)
+
+        src_pts = od_points[:, 0]  # (K,2)
+        dst_pts = od_points[:, 1]  # (K,2)
+        euclid = (src_pts - dst_pts).norm(dim=-1)  # (K,)
+        valid_od = euclid > 1e-6
+        if not bool(valid_od.any()):
+            return zero.expand(n_networks)
+        INF = 1e4
+
+        # list に積んでから最後にstackする(in-placeなインデックス代入は自動微分を壊しうるため避ける)
+        penalty_list: list[torch.Tensor] = [zero] * n_networks
+
+        for net_id, (ns, ne) in enumerate(self.node_ranges):
+            es, ee = self.edge_ranges[net_id]
+            if ee <= es or ne <= ns:
+                continue
+            local_nodes = self.nodes[ns:ne]  # (v,2) 微分対象
+            local_edges = self.edges[es:ee] - ns  # (e,2) local long index
+            v = local_nodes.shape[0]
+
+            with torch.no_grad():
+                d_src = (local_nodes.unsqueeze(0) - src_pts.unsqueeze(1)).norm(dim=-1)  # (K,v)
+                d_dst = (local_nodes.unsqueeze(0) - dst_pts.unsqueeze(1)).norm(dim=-1)  # (K,v)
+                src_idx = d_src.argmin(dim=-1)  # (K,)
+                dst_idx = d_dst.argmin(dim=-1)  # (K,)
+
+            p0 = local_nodes[local_edges[:, 0]]
+            p1 = local_nodes[local_edges[:, 1]]
+            edge_len = (p1 - p0).norm(dim=-1)  # (e,) 微分対象
+
+            u = torch.cat([local_edges[:, 0], local_edges[:, 1]])  # (2e,) 実際の隣接エッジのみ(自己ループなし)
+            w_node = torch.cat([local_edges[:, 1], local_edges[:, 0]])  # (2e,)
+            edge_w = torch.cat([edge_len, edge_len])
+
+            K = od_points.shape[0]
+            dist = torch.full((K, v), INF, dtype=dtype, device=device)
+            dist.scatter_(1, src_idx.unsqueeze(1), 0.0)
+
+            u_exp = u.unsqueeze(0).expand(K, -1)
+            w_node_exp = w_node.unsqueeze(0).expand(K, -1)
+            for _ in range(n_iters):
+                # 隣接ノードからの候補のみをsoftminで集約する(自己ループを混ぜると、収束後も
+                # 同じ値が毎反復自分自身+隣接の両方から重複して足し合わされ、log(重複数)/beta の
+                # 下方向バイアスが反復のたびに蓄積してしまう)。
+                msg = dist.gather(1, u_exp) + edge_w.unsqueeze(0)  # (K, 2e)
+                # 勾配追跡のため out-of-place の scatter_reduce/scatter_add を使う(in-place版は
+                # msgが勾配を要求していても非grad tensorへの書き込みで勾配が途切れる)
+                seg_min = torch.scatter_reduce(
+                    torch.full((K, v), INF, dtype=dtype, device=device), 1, w_node_exp, msg,
+                    reduce="amin", include_self=True,
+                )
+                shifted = msg - seg_min.gather(1, w_node_exp)
+                exp_sum = torch.zeros((K, v), dtype=dtype, device=device).scatter_add(
+                    1, w_node_exp, torch.exp(-beta * shifted)
+                )
+                softmin_neighbors = seg_min - torch.log(exp_sum) / beta
+                # 「これまでの最良値」との組み合わせは厳密なminで行う(minは a==b で正確に a を返すため
+                # バイアスが生じない。torch.minimumも勾配は通る=最小を達成した側にサブ勾配が流れる)。
+                dist = torch.minimum(dist, softmin_neighbors)
+
+            soft_path_len = dist.gather(1, dst_idx.unsqueeze(1)).squeeze(1)  # (K,)
+            excess = (soft_path_len - euclid).clamp(min=0.0)
+            penalty_list[net_id] = excess[valid_od].mean()
+
+        return torch.stack(penalty_list)
+
     @classmethod
     def patch_args(cls, args: CityCollectionArgs) -> Type["CityNetworkCollection"]:
         return type(
