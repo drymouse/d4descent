@@ -42,7 +42,7 @@ class CityArgs(TaskArgs):
     better_abs_eps: float = 1e-8
     # cleanup で密集地帯のノードと接続道路を間引く(Road文法のdecimate_denseと同型)。
     decimate_dense: bool = True
-    decimate_cell_size: float = 0.06
+    decimate_cell_size: float = 0.1
     decimate_max_per_cell: int = 2
     # cleanup で、ノードを共有せずに幾何的に交差してしまった2辺(勾配降下でノード位置が動いた結果
     # 生じうる)を検出し、交点にノードを挿入して分割する(Repairability: 「交差する道路は必ず

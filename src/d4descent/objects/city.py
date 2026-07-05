@@ -711,7 +711,7 @@ class CityNetwork:
 
 @dataclass
 class CityCollectionArgs:
-    width: float = 0.02  # 道路(街路)の幅。City文法では全道路が単一のこの幅を持つ
+    width: float = 0.05  # 道路(街路)の幅。City文法では全道路が単一のこの幅を持つ
 
 
 def _always_raise() -> CityCollectionArgs:

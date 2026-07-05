@@ -26,9 +26,9 @@ def main():
     b.add("--task.cleanup_min_angle", math.radians(20))
     # cleanup で密集地帯のノードと接続道路を間引く(交差解消の断片化暴走に対する安全弁も兼ねる)
     b.add("--task.decimate_dense", True)
-    b.add("--task.decimate_cell_size", 0.06)
+    b.add("--task.decimate_cell_size", 0.1)
     b.add("--task.decimate_max_per_cell", 2)
-    b.add("--task.city_collection_args.width", 0.02)  # 単一種類の道路(街路)の幅
+    b.add("--task.city_collection_args.width", 0.05)  # 単一種類の道路(街路)の幅
     b.add("--task.rewrite_args.length_range", [0.05, 0.15])
     b.add("--task.rewrite_args.snap_radius", 0.05)
     b.add("--task.rewrite_args.add_weight", 3.0)  # 先端から伸ばす候補を多めに生成する
