@@ -26,6 +26,7 @@ from ._base import Task, TaskArgs, RenderArgs, StateT, ExtraMetrics
 from ..visualizer import MPLVisualizer
 from ..losses._base import LossArgs
 from ..losses.raster import RasterLossMixin, RasterLossArgs
+from ..losses.sds import SDSLossMixin, SDSLossArgs
 
 
 @dataclass
@@ -66,6 +67,8 @@ class CityArgs(TaskArgs):
         if isinstance(loss_args, RasterLossArgs):
             assert target_img is not None, "target_img (図形のシルエット, [0,1]) must be provided"
             return CityRasterTask(self, render_args, loss_args, target_img)
+        elif isinstance(loss_args, SDSLossArgs):
+            return CitySDSTask(self, render_args, loss_args, device)
         else:
             raise NotImplementedError(f"Unknown loss_args type: {type(loss_args)}")
 
@@ -439,6 +442,50 @@ class CityRasterTask(RasterLossMixin[CityNetwork, CityRewrite, None], CityTask[N
         ax = fig[0]
         extent = (self.render_args.lim[0], self.render_args.lim[1], self.render_args.lim[1], self.render_args.lim[0])
         ax.ax.imshow(self.target_img.detach().cpu().numpy(), extent=extent, cmap="plasma", vmin=0, vmax=1, alpha=0.25)
+        imgs = collection.render01(
+            self.render_args.size, self.render_args.lim, center_pixel=self.render_args.center_pixel, blur=self.render_args.blur
+        )
+        ax.ax.imshow(imgs[0].detach().cpu().numpy(), extent=extent, cmap="winter", vmin=0, vmax=1, alpha=0.35)
+        net.visualize(ax)
+        ax.ax.set_title(f"{self.get_elapsed_time():.0f}s: {net.id}: {loss:.2e}: E{len(net.edges)}")
+        return fig.get_image()
+
+
+class CitySDSTask(SDSLossMixin[CityNetwork, CityRewrite, None], CityTask[None]):
+    """
+    City文法をSDS(Score Distillation Sampling)損失で最適化するタスク。target_imgの代わりに
+    テキストプロンプトから学習済み拡散モデルの勾配を受け取る(URSDSTaskと同じパターン)。
+    target_imgが存在しないため、図形内部への偏りサンプル(_precompute_add_anywhere_targets)は使えず、
+    AddAnywhereは基底CityTaskのgen_add_anywhere_targets(None)=lim全体からの一様サンプルにフォールバックする
+    (SDSではキャンバス全体が対象なのでこれで正しい)。
+    """
+
+    def __init__(
+        self, args: CityArgs, render_args: RenderArgs, sds_args: SDSLossArgs, device: Union[str, torch.device]
+    ):
+        CityTask.__init__(self, args, render_args, device)
+        SDSLossMixin.__init__(self, sds_args)  # ここでSDがロードされる(GPU必須・初回は数GBのDL)
+
+    def initialize_state(self) -> None:
+        return None
+
+    def compute_losses(
+        self, collection: ObjectCollection[CityNetwork], state: None
+    ) -> tuple[torch.Tensor, ExtraMetrics]:
+        losses, xtra = self._compute_losses(collection, state)  # SDSLossMixin: SDS損失
+        assert isinstance(collection, CityNetworkCollection)
+        if self.args.size_weight != 0.0:
+            cost = collection.get_construction_costs()
+            losses = losses + self.args.size_weight * cost
+        return losses, xtra
+
+    def visualize(self, collection: ObjectCollection[CityNetwork], step: int, loss: float, state: None) -> np.ndarray:
+        assert isinstance(collection, CityNetworkCollection)
+        assert len(collection) == 1
+        net = collection[0]
+        fig = MPLVisualizer(1, 1, 10.8, 10.8, xlim=self.render_args.lim, ylim=self.render_args.lim, notebook=False)
+        ax = fig[0]
+        extent = (self.render_args.lim[0], self.render_args.lim[1], self.render_args.lim[1], self.render_args.lim[0])
         imgs = collection.render01(
             self.render_args.size, self.render_args.lim, center_pixel=self.render_args.center_pixel, blur=self.render_args.blur
         )
