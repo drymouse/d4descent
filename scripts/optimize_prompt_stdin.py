@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 import sys
+import gc
 import shutil
 import numpy as np
 import torch
@@ -100,30 +101,38 @@ def main():
         cur_loss = replace(args.loss, prompt=prompt)
         task = args.task.create(args.render, cur_loss, args.device, None)
 
-        optim = replace(args.optim)
-        retry = 5
-        while retry > 0:
-            try:
-                all_imgs: list[np.ndarray] = []
+        try:
+            optim = replace(args.optim)
+            retry = 5
+            while retry > 0:
+                try:
+                    all_imgs: list[np.ndarray] = []
 
-                top_shape, loss, all_objects, all_metrics = optimize(task, optim, on_visualize)
-                if save_path is not None:
-                    Collection = task.get_collection_constructor()
-                    torch.save(Collection.from_object(top_shape).to_savable(), save_path / "topshape.objc")
-                    torch.save(all_objects.to_savable(), save_path / "all_objects.objc")
-                    torch.save(all_metrics, save_path / "metrics.pt")
-                    save_video(save_path / "video.mp4", all_imgs, fps=5)
-                    print(f"--> Saved to {save_path}")
-                break
-            except torch.cuda.OutOfMemoryError:
-                print("--> Out of memory, retrying")
-                if optim.batch_size is not None:
-                    if optim.batch_size == 1:
-                        raise RuntimeError("Out of memory")
-                    optim.batch_size = optim.batch_size // 2
-                else:
-                    optim.batch_param_count = optim.batch_param_count // 2
-                retry -= 1
+                    top_shape, loss, all_objects, all_metrics = optimize(task, optim, on_visualize)
+                    if save_path is not None:
+                        Collection = task.get_collection_constructor()
+                        torch.save(Collection.from_object(top_shape).to_savable(), save_path / "topshape.objc")
+                        torch.save(all_objects.to_savable(), save_path / "all_objects.objc")
+                        torch.save(all_metrics, save_path / "metrics.pt")
+                        save_video(save_path / "video.mp4", all_imgs, fps=5)
+                        print(f"--> Saved to {save_path}")
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    print("--> Out of memory, retrying")
+                    if optim.batch_size is not None:
+                        if optim.batch_size == 1:
+                            raise RuntimeError("Out of memory")
+                        optim.batch_size = optim.batch_size // 2
+                    else:
+                        optim.batch_param_count = optim.batch_param_count // 2
+                    retry -= 1
+        finally:
+            # 次のプロンプトに移る前にSD一式(数GB)を確実に解放する。対話ループでプロンプトを
+            # 何本も続けて処理するため、ここで解放しないとVRAMが積み上がっていく恐れがある。
+            del task
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

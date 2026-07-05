@@ -1,0 +1,39 @@
+task:
+  $type: d4descent.tasks.city.CityArgs
+  cost_weight: 1.0e-4
+  size_weight: 0.0
+  cleanup_resolve_crossings: true
+  cleanup_max_iter: 4
+  cleanup_min_seg: 0.04
+  cleanup_min_angle: 0.3490658503988659  # math.radians(20)
+  decimate_dense: true
+  decimate_cell_size: 0.1
+  decimate_max_per_cell: 2
+  city_collection_args:
+    width: 0.05
+  rewrite_args:
+    length_range: [0.05, 0.15]
+    snap_radius: 0.05
+    add_weight: 3.0
+    add_anywhere_weight: 1.0
+    n_add_anywhere_candidates: 32
+loss:
+  $type: d4descent.losses.sds.SDSLossArgs
+  prompt: ""
+  sd:
+    pretrained_model_name_or_path: stable-diffusion-v1-5/stable-diffusion-v1-5
+render:
+  size: 600
+  blur: 0.7071067811865475
+optim:
+  proposal_trigger: step
+  propose_every: 50
+  proposal_size: 64  # SDSは1件ごとの評価コストが重いので、全候補ではなくここで間引く(既定0=全件は危険)
+  scheduler: none
+  lr: 0.01
+  batch_size: 4  # SD forward passはノード数でなく画像枚数で重いので、param_count基準ではなく固定4件/バッチにする
+  n_steps: 1500
+  proposal_criterion: loss
+  proposal_steps: 1
+prompt_suffix: "top-down map, black lines on white background"
+restart: false
